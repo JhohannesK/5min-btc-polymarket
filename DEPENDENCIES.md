@@ -27,17 +27,21 @@
 
 **Status**: Fallback implementation using spot prices
 
-**Required for Production**:
-- Direct connection to Chainlink BTC/USD 60s TWAP oracle feed
-- On-chain or reliable API access to the exact TWAP series Polymarket uses for settlement
+**CRITICAL (Research Requirements)**:
+- **Canonical feed**: Chainlink BTC/USD **60s TWAP** only (since Aug 14, 2026)
+- **RTDS endpoint**: `data.chain.link/streams/btc-usd-twap-60s-streams`
+- **RTDS topic**: `crypto_prices_twap_sixty`
+- **Filter**: `{"symbol":"btc/usd"}`
+- **Ship-blocker**: Must log `windowSeconds` on every TWAP operation to prevent silent 30s/60s mix
 
 **Current Implementation**:
 - `ChainlinkTWAPTracker` in `scripts/btc_5m_twap_fair.py`
 - Falls back to averaging spot prices from Binance/Coinbase
-- Marks data source as `"spot_estimate"` in outputs
+- Marks source as `"spot_estimate_60s"` with `windowSeconds=60`
+- Logs `[TWAP_PIN]` and `[TWAP_CALC]` with windowSeconds for verification
 
-**TODO for Production**:
-Replace `_estimate_twap_from_spot()` with actual Chainlink oracle connection.
+**Production Requirements**:
+See `RTDS_INTEGRATION.md` for complete RTDS connection details, logging requirements, and ship-blocker checklist.
 
 ## Python Dependencies
 

@@ -34,6 +34,8 @@ def main():
         return 1
     
     print(f"   ✓ TWAP: ${twap_snapshot.twap_60s:,.2f}")
+    print(f"   ✓ Window: {twap_snapshot.window_seconds}s")
+    print(f"   ✓ Series: {twap_snapshot.series_id}")
     print(f"   ✓ Source: {twap_snapshot.source}")
     print(f"   ✓ Timestamp: {twap_snapshot.timestamp}")
     
@@ -46,6 +48,8 @@ def main():
     test_slug = "btc-updown-5m-1234567890"
     pin = calc.pin_window_open(test_slug)
     print(f"   ✓ Pinned: ${pin.twap_60s:,.2f}")
+    print(f"   ✓ Window: {pin.window_seconds}s (MUST be 60s)")
+    print(f"   ✓ Series: {pin.series_id}")
     
     # Calculate fair value at different seconds left
     print("\n5. Calculating fair values at different times...")
@@ -89,6 +93,11 @@ def main():
     print("✓ Fair value calculation functional")
     print("✓ Edge estimation working")
     print("✓ Hold-EV calculation working")
+    print("\n⚠️  PRODUCTION REQUIREMENTS:")
+    print("   - Connect to RTDS topic: crypto_prices_twap_sixty")
+    print("   - Filter: {\"symbol\":\"btc/usd\"}")
+    print("   - Validate windowSeconds == 60 (ship-blocker)")
+    print("   - Endpoint: data.chain.link/streams/btc-usd-twap-60s-streams")
     return 0
 
 

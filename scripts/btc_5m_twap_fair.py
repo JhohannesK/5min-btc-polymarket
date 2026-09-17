@@ -24,7 +24,9 @@ class TWAPSnapshot:
     """A point-in-time TWAP reading."""
     timestamp: float
     twap_60s: float
+    window_seconds: int
     source: str = "chainlink"
+    series_id: str = "btc-usd-twap-60s"
 
 
 @dataclass
@@ -43,22 +45,30 @@ class ChainlinkTWAPTracker:
     """
     Fetches Chainlink BTC/USD 60s TWAP.
     
-    Note: In production, this should connect to on-chain Chainlink aggregator
-    or a reliable oracle feed. For now, we'll use a fallback that estimates
-    60s TWAP from spot prices.
+    PRODUCTION REQUIREMENT (Research):
+    - Canonical feed: data.chain.link/streams/btc-usd-twap-60s-streams
+    - Via RTDS: topic `crypto_prices_twap_sixty` with filter `{"symbol":"btc/usd"}`
+    - Since Aug 14, 2026: 5m crypto markets use 60s series ONLY
+    - Never mix 30s and 60s — always log windowSeconds to prevent silent mix
+    
+    Current implementation uses spot fallback; production must connect to RTDS.
     """
     
-    def __init__(self, fallback_to_spot: bool = True):
+    def __init__(self, fallback_to_spot: bool = True, rtds_endpoint: Optional[str] = None):
         self.fallback_to_spot = fallback_to_spot
+        self.rtds_endpoint = rtds_endpoint
         self._cache: dict[str, TWAPSnapshot] = {}
         self._cache_ttl_sec = 5.0
+        self._window_seconds = 60  # REQUIRED: 60s series only
     
     def get_current_twap(self) -> Optional[TWAPSnapshot]:
         """
         Fetch current Chainlink BTC/USD 60s TWAP.
         
-        TODO: Replace with actual Chainlink on-chain or oracle API call.
-        For now, falls back to estimating from spot.
+        PRODUCTION: Connect to RTDS topic `crypto_prices_twap_sixty`
+        Filter: `{"symbol":"btc/usd"}`
+        
+        For now, falls back to estimating from spot with windowSeconds=60 logged.
         """
         cache_key = "current"
         now = time.time()
@@ -69,15 +79,32 @@ class ChainlinkTWAPTracker:
                 return cached
         
         try:
-            # TODO: Connect to actual Chainlink BTC/USD 60s TWAP feed
-            # For now, use a spot-based estimate as fallback
+            # PRODUCTION TODO: Connect to RTDS
+            # endpoint: self.rtds_endpoint or data.chain.link/streams/btc-usd-twap-60s-streams
+            # topic: crypto_prices_twap_sixty
+            # filter: {"symbol":"btc/usd"}
+            # Extract: value, windowSeconds, timestamp
+            # Validate: windowSeconds == 60 (ship-blocker if not)
+            
+            if self.rtds_endpoint:
+                # Production RTDS connection would go here
+                # response = requests.post(self.rtds_endpoint, json={
+                #     "topic": "crypto_prices_twap_sixty",
+                #     "filter": {"symbol": "btc/usd"}
+                # })
+                # Validate response['windowSeconds'] == 60
+                pass
+            
+            # Fallback to spot estimate
             if self.fallback_to_spot:
                 twap_value = self._estimate_twap_from_spot()
                 if twap_value is not None:
                     snapshot = TWAPSnapshot(
                         timestamp=now,
                         twap_60s=twap_value,
-                        source="spot_estimate"
+                        window_seconds=self._window_seconds,
+                        source="spot_estimate_60s",
+                        series_id="btc-usd-twap-60s-fallback"
                     )
                     self._cache[cache_key] = snapshot
                     return snapshot
@@ -142,6 +169,7 @@ class FairValueCalculator:
         """
         Pin the TWAP at window open for a market.
         
+        CRITICAL: Logs windowSeconds on every pin (ship-blocker requirement).
         Call this once when a new 5m market becomes active.
         Returns the pinned TWAP snapshot.
         """
@@ -150,6 +178,18 @@ class FairValueCalculator:
         
         current = self.twap_tracker.get_current_twap()
         if current:
+            # SHIP-BLOCKER: Log windowSeconds to prevent silent 30s/60s mix
+            print(f"[TWAP_PIN] market={market_slug} "
+                  f"windowSeconds={current.window_seconds} "
+                  f"series={current.series_id} "
+                  f"value={current.twap_60s:.2f} "
+                  f"source={current.source}")
+            
+            # Validate 60s series (enforce since Aug 14, 2026)
+            if current.window_seconds != 60:
+                print(f"[TWAP_PIN_ERROR] WRONG WINDOW: got {current.window_seconds}s, expected 60s")
+                return None
+            
             self._window_pins[market_slug] = current
         
         return current
@@ -168,6 +208,8 @@ class FairValueCalculator:
         """
         Calculate fair P(Up) for a 5m market.
         
+        CRITICAL: Logs windowSeconds on every calculation (ship-blocker requirement).
+        
         Args:
             market_slug: Market identifier (e.g. btc-updown-5m-1234567890)
             seconds_left: Seconds remaining until settlement
@@ -177,18 +219,31 @@ class FairValueCalculator:
             FairValue with P(Up), P(Down), and edge signal
         """
         # Get pinned window-open TWAP
-        open_twap = self.get_window_open_twap(market_slug)
-        if open_twap is None:
+        open_twap_snapshot = self._window_pins.get(market_slug)
+        if open_twap_snapshot is None:
             open_twap_snapshot = self.pin_window_open(market_slug)
             if open_twap_snapshot is None:
                 return None
-            open_twap = open_twap_snapshot.twap_60s
+        open_twap = open_twap_snapshot.twap_60s
         
         # Get current TWAP
         current_snapshot = self.twap_tracker.get_current_twap()
         if current_snapshot is None:
             return None
         current_twap = current_snapshot.twap_60s
+        
+        # SHIP-BLOCKER: Log windowSeconds on every calculation
+        print(f"[TWAP_CALC] market={market_slug} "
+              f"windowSeconds={current_snapshot.window_seconds} "
+              f"series={current_snapshot.series_id} "
+              f"open={open_twap:.2f} current={current_twap:.2f}")
+        
+        # Validate 60s series match
+        if current_snapshot.window_seconds != 60 or open_twap_snapshot.window_seconds != 60:
+            print(f"[TWAP_CALC_ERROR] WINDOW MISMATCH: "
+                  f"current={current_snapshot.window_seconds}s, "
+                  f"open={open_twap_snapshot.window_seconds}s")
+            return None
         
         # Calculate implied move and residual vol
         price_ratio = current_twap / open_twap
@@ -253,12 +308,18 @@ def estimate_trade_edge(
     """
     Estimate edge of buying at book_ask vs fair value.
     
+    Fee math (Research requirement):
+    - Crypto taker fee = C × 0.07 × p × (1-p)
+    - Makers pay 0
+    - Peak ~$1.75/100 shares at 50¢, ~$1.47 at 70¢
+    - Edge must clear fee + half-spread + depth-to-size
+    
     Args:
         fair_p: Fair probability estimate (0 to 1)
         book_ask: CLOB best ask price
         book_bid: CLOB best bid price
         shares: Position size in shares
-        taker_fee_rate: Polymarket crypto taker fee rate (default 0.07)
+        taker_fee_rate: Polymarket crypto taker fee rate (0.07)
     
     Returns:
         Dict with edge_bps, cost_bps, net_edge_bps, and trade_signal
@@ -266,15 +327,19 @@ def estimate_trade_edge(
     spread = max(0, book_ask - book_bid)
     half_spread_bps = (spread / 2.0) * 10000
     
-    # Taker fee: shares × fee_rate × p × (1-p)
-    taker_fee = shares * taker_fee_rate * book_ask * (1 - book_ask)
-    taker_fee_bps = (taker_fee / shares) * 10000 if shares > 0 else 0
+    # Taker fee: C × 0.07 × p × (1-p)
+    # Peak fee at p=0.5: 100 × 0.07 × 0.5 × 0.5 = $1.75 per 100 shares
+    # At p=0.7: 100 × 0.07 × 0.7 × 0.3 = $1.47 per 100 shares
+    taker_fee_total = shares * taker_fee_rate * book_ask * (1 - book_ask)
+    taker_fee_per_share = taker_fee_total / shares if shares > 0 else 0
+    taker_fee_bps = taker_fee_per_share * 10000
     
     # Edge: fair value - book price
     edge = fair_p - book_ask
     edge_bps = edge * 10000
     
     # Total cost: half-spread + taker fee
+    # Note: depth-to-size should be added for larger orders
     cost_bps = half_spread_bps + taker_fee_bps
     
     # Net edge after costs
@@ -294,11 +359,14 @@ def estimate_trade_edge(
         "book_bid": book_bid,
         "spread_bps": spread * 10000,
         "half_spread_bps": half_spread_bps,
+        "taker_fee_total_usd": taker_fee_total,
+        "taker_fee_per_share_usd": taker_fee_per_share,
         "taker_fee_bps": taker_fee_bps,
         "cost_bps": cost_bps,
         "edge_bps": edge_bps,
         "net_edge_bps": net_edge_bps,
-        "signal": signal
+        "signal": signal,
+        "note": "Edge must clear fee + half-spread (+ depth-to-size for large orders)"
     }
 
 
