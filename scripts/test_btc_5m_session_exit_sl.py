@@ -15,6 +15,15 @@ from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds
 
+from btc_5m_twap_fair import (
+    ChainlinkTWAPTracker,
+    FairValueCalculator,
+    estimate_trade_edge,
+    calculate_hold_ev
+)
+from log_twap_settle import log_twap_settle
+from btc_5m_state_tracker import StateTracker, TicketState
+
 UTC = dt.timezone.utc
 
 
@@ -297,6 +306,10 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_entry_seconds_left': 60,
             'entry_timeout_min': 60,
             'poll_sec': 5.0,
+            'use_twap_fair_value': True,
+            'min_edge_bps': 5.0,
+            'btc_daily_vol_pct': 3.5,
+            'hold_to_redeem': True,
         },
         'aggressive': {
             'threshold': 0.70,
@@ -306,6 +319,10 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_entry_seconds_left': 60,
             'entry_timeout_min': 60,
             'poll_sec': 5.0,
+            'use_twap_fair_value': True,
+            'min_edge_bps': 3.0,
+            'btc_daily_vol_pct': 3.5,
+            'hold_to_redeem': True,
         },
     }
     
@@ -322,6 +339,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             sizing = profile_data.get('sizing', {})
             stop_loss = profile_data.get('stop_loss', {})
             session_timing = config.get('shared_rules', {}).get('session_timing', {})
+            twap_fair = profile_data.get('twap_fair_value', {})
             
             profiles[profile_name] = {
                 'threshold': signal.get('threshold_price', 0.70),
@@ -331,6 +349,10 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
                 'min_entry_seconds_left': session_timing.get('min_entry_seconds_left', 60),
                 'entry_timeout_min': 60,
                 'poll_sec': 5.0,
+                'use_twap_fair_value': twap_fair.get('enabled', True),
+                'min_edge_bps': twap_fair.get('min_edge_bps', 5.0),
+                'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
+                'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
             }
         
         return profiles if profiles else fallback_profiles
@@ -357,6 +379,14 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.entry_timeout_min = int(prof['entry_timeout_min'])
     if args.poll_sec is None:
         args.poll_sec = float(prof['poll_sec'])
+    if args.use_twap_fair_value is None:
+        args.use_twap_fair_value = bool(prof.get('use_twap_fair_value', True))
+    if args.min_edge_bps is None:
+        args.min_edge_bps = float(prof.get('min_edge_bps', 5.0))
+    if args.btc_daily_vol_pct is None:
+        args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
+    if args.hold_to_redeem is None:
+        args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
     return args
 
 
@@ -365,6 +395,31 @@ def default_repo_path() -> str:
     if env_repo:
         return env_repo
     return str(Path(__file__).resolve().parents[3] / 'pm-hl-conservative-plus-repo')
+
+
+def check_kill_switch() -> Optional[str]:
+    """
+    Check for kill switch file.
+    
+    Returns:
+        Action if kill switch is active: 'flatten' or 'hold', None otherwise
+    """
+    kill_file = Path(__file__).parent.parent / 'runtime' / '.kill'
+    if not kill_file.exists():
+        return None
+    
+    try:
+        with open(kill_file, 'r') as f:
+            content = f.read()
+        
+        for line in content.split('\n'):
+            if line.startswith('action:'):
+                action = line.split(':', 1)[1].strip()
+                return action if action in ['flatten', 'hold'] else 'flatten'
+    except Exception:
+        pass
+    
+    return 'flatten'
 
 
 def main():
@@ -380,8 +435,30 @@ def main():
     ap.add_argument('--poll-sec', type=float, default=None)
     ap.add_argument('--close-retry-max', type=int, default=18, help='Max close retries when position is not yet visible / not immediately closable')
     ap.add_argument('--close-retry-delay-sec', type=float, default=2.0, help='Delay between close retries')
+    ap.add_argument('--use-twap-fair-value', type=bool, default=None, help='Use TWAP fair value for entry (default True)')
+    ap.add_argument('--min-edge-bps', type=float, default=None, help='Minimum edge in bps to enter (default 5.0)')
+    ap.add_argument('--btc-daily-vol-pct', type=float, default=None, help='BTC daily vol % for fair value calc (default 3.5)')
+    ap.add_argument('--hold-to-redeem', type=bool, default=None, help='Hold to redeem unless bid >= hold-EV (default True)')
+    ap.add_argument('--legacy-threshold-mode', action='store_true', help='Use legacy threshold-only mode (for debug/comparison)')
     ap.add_argument('--execute', action='store_true')
     args = apply_profile(ap.parse_args())
+
+    # Initialize TWAP tracker and fair value calculator
+    use_fair_value = args.use_twap_fair_value and not args.legacy_threshold_mode
+    if use_fair_value:
+        # Allow fallback for dry-run; RTDS required for --execute
+        twap_tracker = ChainlinkTWAPTracker()
+        fair_calc = FairValueCalculator(twap_tracker)
+    else:
+        twap_tracker = None
+        fair_calc = None
+    
+    # Initialize state tracker for one-ticket-per-bucket and daily limits
+    state_tracker = StateTracker(
+        state_dir=Path(__file__).parent.parent / 'runtime' / 'state',
+        daily_loss_limit_usd=50.0,
+        max_trades_per_day=20
+    )
 
     report: dict[str, Any] = {
         'started_at': ts_utc(),
@@ -397,15 +474,36 @@ def main():
             'close_retry_max': args.close_retry_max,
             'close_retry_delay_sec': args.close_retry_delay_sec,
             'execute': args.execute,
+            'use_twap_fair_value': use_fair_value,
+            'min_edge_bps': args.min_edge_bps if use_fair_value else None,
+            'btc_daily_vol_pct': args.btc_daily_vol_pct if use_fair_value else None,
+            'hold_to_redeem': args.hold_to_redeem,
+            'legacy_threshold_mode': args.legacy_threshold_mode,
         },
         'attempts': [],
     }
 
     deadline = time.time() + args.entry_timeout_min * 60
     opened = None
+    
+    # Daily summary at start
+    daily_summary = state_tracker.get_daily_summary()
+    report['daily_summary_start'] = daily_summary
 
     while time.time() < deadline:
         try:
+            # Check kill switch
+            kill_action = check_kill_switch()
+            if kill_action:
+                report['kill_switch_triggered'] = {
+                    'ts': ts_utc(),
+                    'action': kill_action,
+                }
+                report['result'] = f'kill_switch_{kill_action}'
+                report['finished_at'] = ts_utc()
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return
+            
             m = resolve_active_current_5m_market()
             if not m:
                 report['attempts'].append({'ts': ts_utc(), 'status': 'heartbeat_no_current_market'})
@@ -413,6 +511,20 @@ def main():
                 continue
 
             g_up, g_dn, up_t, dn_t, slug, end_iso = market_side_prices(m)
+            
+            # Check one-ticket-per-bucket and daily limits
+            current_bucket = bucket_5m(int(time.time()))
+            can_open, reason = state_tracker.can_open_ticket(current_bucket)
+            if not can_open:
+                report['attempts'].append({
+                    'ts': ts_utc(),
+                    'slug': slug,
+                    'status': 'skip_state_check_failed',
+                    'reason': reason,
+                    'bucket': current_bucket,
+                })
+                time.sleep(args.poll_sec)
+                continue
 
             end_ts = None
             sec_left = None
@@ -473,26 +585,131 @@ def main():
                 time.sleep(args.poll_sec)
                 continue
 
-            candidates: list[tuple[str, float]] = []
-            if up_ask is not None and float(up_ask) >= args.threshold:
-                candidates.append(('UP', float(up_ask)))
-            if dn_ask is not None and float(dn_ask) >= args.threshold:
-                candidates.append(('DOWN', float(dn_ask)))
-
-            if not candidates:
+            # Entry logic: TWAP fair value or legacy threshold
+            if use_fair_value and fair_calc is not None:
+                # Check RTDS requirement for --execute mode
+                if args.execute and twap_tracker:
+                    try:
+                        # Force RTDS for live trading
+                        test_snapshot = twap_tracker.get_current_twap(allow_fallback=False)
+                    except RuntimeError as e:
+                        report['rtds_check_failed'] = str(e)
+                        report['result'] = 'rtds_required_for_execute'
+                        report['finished_at'] = ts_utc()
+                        print(json.dumps(report, ensure_ascii=False, indent=2))
+                        return
+                
+                # Calculate fair value based on TWAP
+                # For --execute mode, never allow fallback; for dry-run, fallback is OK
+                allow_fallback = not args.execute
+                fair_value = fair_calc.calculate_fair_value(
+                    slug, 
+                    sec_left, 
+                    args.btc_daily_vol_pct,
+                    allow_fallback=allow_fallback
+                )
+                
+                if fair_value is None:
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_fair_value_unavailable',
+                        'seconds_left': sec_left,
+                    })
+                    time.sleep(args.poll_sec)
+                    continue
+                
+                # Evaluate edge for both sides
+                up_bid, _ = _best_bid_ask(pub.get_order_book(str(up_t)))
+                dn_bid, _ = _best_bid_ask(pub.get_order_book(str(dn_t)))
+                
+                # Calculate actual shares from stake_usd and price
+                # shares = stake_usd / price (where price is the ask we'd buy at)
+                up_shares = args.stake_usd / up_ask if up_ask and up_ask > 0 else 0
+                dn_shares = args.stake_usd / dn_ask if dn_ask and dn_ask > 0 else 0
+                
+                up_edge = estimate_trade_edge(
+                    fair_value.p_up,
+                    up_ask if up_ask is not None else 0.99,
+                    up_bid if up_bid is not None else 0.01,
+                    shares=up_shares
+                ) if up_ask is not None else None
+                
+                dn_edge = estimate_trade_edge(
+                    fair_value.p_down,
+                    dn_ask if dn_ask is not None else 0.99,
+                    dn_bid if dn_bid is not None else 0.01,
+                    shares=dn_shares
+                ) if dn_ask is not None else None
+                
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
-                    'status': 'skip_price_below_threshold',
-                    'threshold': args.threshold,
-                    'clob_up_ask': up_ask,
-                    'clob_down_ask': dn_ask,
+                    'status': 'fair_value_check',
+                    'fair_p_up': fair_value.p_up,
+                    'fair_p_down': fair_value.p_down,
+                    'window_open_twap': fair_value.window_open_twap,
+                    'current_twap': fair_value.current_twap,
+                    'edge_signal': fair_value.edge_signal,
+                    'up_ask': up_ask,
+                    'dn_ask': dn_ask,
+                    'up_edge_bps': up_edge['net_edge_bps'] if up_edge else None,
+                    'dn_edge_bps': dn_edge['net_edge_bps'] if dn_edge else None,
                     'seconds_left': sec_left,
                 })
-                time.sleep(args.poll_sec)
-                continue
+                
+                # Select side with best positive edge
+                candidates: list[tuple[str, float, dict]] = []
+                if up_edge and up_edge['net_edge_bps'] >= args.min_edge_bps:
+                    candidates.append(('UP', up_edge['net_edge_bps'], up_edge))
+                if dn_edge and dn_edge['net_edge_bps'] >= args.min_edge_bps:
+                    candidates.append(('DOWN', dn_edge['net_edge_bps'], dn_edge))
+                
+                if not candidates:
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_no_positive_edge',
+                        'min_edge_bps': args.min_edge_bps,
+                        'up_edge_bps': up_edge['net_edge_bps'] if up_edge else None,
+                        'dn_edge_bps': dn_edge['net_edge_bps'] if dn_edge else None,
+                        'seconds_left': sec_left,
+                    })
+                    time.sleep(args.poll_sec)
+                    continue
+                
+                side, best_edge_bps, edge_details = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+                trigger_price = edge_details['book_ask']
+                report['entry_edge_details'] = edge_details
+                report['entry_fair_value'] = {
+                    'p_up': fair_value.p_up,
+                    'p_down': fair_value.p_down,
+                    'window_open_twap': fair_value.window_open_twap,
+                    'current_twap': fair_value.current_twap,
+                    'edge_signal': fair_value.edge_signal,
+                }
+            else:
+                # Legacy threshold-only mode
+                candidates: list[tuple[str, float]] = []
+                if up_ask is not None and float(up_ask) >= args.threshold:
+                    candidates.append(('UP', float(up_ask)))
+                if dn_ask is not None and float(dn_ask) >= args.threshold:
+                    candidates.append(('DOWN', float(dn_ask)))
 
-            side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+                if not candidates:
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_price_below_threshold',
+                        'threshold': args.threshold,
+                        'clob_up_ask': up_ask,
+                        'clob_down_ask': dn_ask,
+                        'seconds_left': sec_left,
+                    })
+                    time.sleep(args.poll_sec)
+                    continue
+
+                side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
             out, objs = run_open(args.repo, slug, side, args.stake_usd, args.execute)
             post = None
@@ -517,8 +734,24 @@ def main():
                     'cost_usdc': cost,
                     'open_order_id': post.get('orderID'),
                     'open_tx': (post.get('transactionsHashes') or [None])[0],
+                    'bucket': current_bucket,
                 }
                 report['open_raw'] = out[-4000:]
+                
+                # Register ticket in state tracker
+                ticket = TicketState(
+                    bucket=current_bucket,
+                    market_slug=slug,
+                    opened_at=time.time(),
+                    side=side,
+                    entry_price=entry_price,
+                    shares=shares,
+                    cost_usdc=cost,
+                    token_id=token_id,
+                    status='open'
+                )
+                state_tracker.open_ticket(ticket)
+                
                 break
             else:
                 report['last_open_try'] = out[-2000:]
@@ -541,28 +774,91 @@ def main():
     except Exception:
         end_ts = time.time() + 300
 
-    sl_price = opened['entry_price'] * (1.0 - args.stop_loss_pct)
-    report['stop_loss_price'] = sl_price
-
-    close_reason = None
-    while True:
-        now = time.time()
-        if now >= (end_ts - args.exit_before_sec):
-            close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
-            break
-
-        # Use CLOB bid (sellable price) for stop-loss, not Gamma mid
-        try:
-            side_px = clob_best_bid(opened['token_id'])
-        except Exception:
-            side_px = get_side_price_from_slug(opened['market_slug'], opened['side'])
+    # Exit monitoring: hold-to-redeem EV or legacy stop-loss
+    if args.hold_to_redeem and use_fair_value and fair_calc is not None:
+        # Hold-to-redeem mode: only exit if selling is better EV than holding
+        report['exit_mode'] = 'hold_to_redeem_ev'
+        close_reason = None
+        held_to_redeem = False
         
-        report['last_side_price'] = side_px
-        report['last_check_at'] = ts_utc()
-        if side_px is not None and side_px <= sl_price:
-            close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
-            break
-        time.sleep(args.poll_sec)
+        while True:
+            now = time.time()
+            if now >= (end_ts - args.exit_before_sec):
+                close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
+                # If exiting very close to settlement, mark as held to redeem
+                if args.exit_before_sec <= 20:
+                    held_to_redeem = True
+                break
+            
+            # Get current fair value and CLOB bid
+            try:
+                sec_left = max(0, end_ts - now)
+                allow_fallback = not args.execute
+                fair_value = fair_calc.calculate_fair_value(
+                    slug, 
+                    sec_left, 
+                    args.btc_daily_vol_pct,
+                    allow_fallback=allow_fallback
+                )
+                if fair_value is None:
+                    time.sleep(args.poll_sec)
+                    continue
+                
+                fair_p_win = fair_value.p_up if opened['side'] == 'UP' else fair_value.p_down
+                current_bid = clob_best_bid(opened['token_id'])
+                
+                if current_bid is None:
+                    time.sleep(args.poll_sec)
+                    continue
+                
+                hold_ev = calculate_hold_ev(
+                    fair_p_win,
+                    current_bid,
+                    shares=opened['shares']
+                )
+                
+                report['last_hold_ev_check'] = {
+                    'ts': ts_utc(),
+                    'fair_p_win': fair_p_win,
+                    'current_bid': current_bid,
+                    'hold_ev': hold_ev['hold_ev'],
+                    'sell_ev': hold_ev['sell_ev'],
+                    'recommendation': hold_ev['recommendation'],
+                }
+                
+                # Exit only if sell EV > hold EV
+                if hold_ev['recommendation'] == 'sell':
+                    close_reason = 'sell_ev_exceeds_hold_ev'
+                    break
+            except Exception as e:
+                report['hold_ev_check_error'] = str(e)
+            
+            time.sleep(args.poll_sec)
+    else:
+        # Legacy stop-loss mode
+        report['exit_mode'] = 'legacy_stop_loss'
+        sl_price = opened['entry_price'] * (1.0 - args.stop_loss_pct)
+        report['stop_loss_price'] = sl_price
+        close_reason = None
+        
+        while True:
+            now = time.time()
+            if now >= (end_ts - args.exit_before_sec):
+                close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
+                break
+
+            # Use CLOB bid (sellable price) for stop-loss, not Gamma mid
+            try:
+                side_px = clob_best_bid(opened['token_id'])
+            except Exception:
+                side_px = get_side_price_from_slug(opened['market_slug'], opened['side'])
+            
+            report['last_side_price'] = side_px
+            report['last_check_at'] = ts_utc()
+            if side_px is not None and side_px <= sl_price:
+                close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
+                break
+            time.sleep(args.poll_sec)
 
     close_debug: list[dict[str, Any]] = []
     close_obj: dict[str, Any] = {}
@@ -752,10 +1048,34 @@ def main():
     # Report result accurately: done only if close succeeded, otherwise incomplete/failed
     if closed['close_success']:
         report['result'] = 'done'
+        close_status = 'closed'
     elif closed['close_skipped']:
         report['result'] = 'incomplete_close_skipped'
+        close_status = 'failed'
     else:
         report['result'] = 'incomplete_close_failed'
+        close_status = 'failed'
+    
+    # Update state tracker with close
+    pnl_for_tracker = pnl if pnl is not None else 0.0
+    state_tracker.close_ticket(opened['bucket'], pnl_for_tracker, close_status)
+    
+    # Log TWAP settlement if position was held to redeem
+    if args.hold_to_redeem and use_fair_value and fair_calc is not None:
+        window_open_twap = fair_calc.get_window_open_twap(opened['market_slug'])
+        if window_open_twap is not None and held_to_redeem:
+            try:
+                settle_result = log_twap_settle(
+                    opened['market_slug'],
+                    window_open_twap,
+                    opened['side']
+                )
+                report['twap_settlement'] = settle_result
+            except Exception as e:
+                report['twap_settlement_error'] = str(e)
+    
+    # Daily summary at end
+    report['daily_summary_end'] = state_tracker.get_daily_summary()
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

@@ -1,0 +1,10 @@
+# Kill switch template
+# To enable kill switch: copy this file to runtime/.kill
+# When .kill exists, trading is disabled.
+# 
+# Actions:
+#   flatten: Cancel orders and close all positions
+#   hold: Cancel orders and hold positions to settlement
+#
+# Example:
+#   action: flatten

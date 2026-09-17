@@ -1,6 +1,6 @@
 ---
 name: btc-5m-live
-description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using momentum-near-close logic (time-left, BTC move, market skew), fixed/controlled sizing, optional micro-hedge, and one-shot or loop execution.
+description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Chainlink TWAP fair-value estimation. Trades the cheap side vs fair when edge clears costs. Holds to redeem unless selling yields higher EV.
 ---
 
 # BTC 5m Live
@@ -9,16 +9,17 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using mo
 - Main trading repo: `<your-workspace>/pm-hl-conservative-plus-repo` (or set `BTC5M_REPO`)
 - Core runner: `src/live/pm_live_trade_runner.py`
 - Canonical skill runner: `scripts/test_btc_5m_session_exit_sl.py`
+- TWAP fair value module: `scripts/btc_5m_twap_fair.py`
+- State tracker: `scripts/btc_5m_state_tracker.py`
 - Skill control entrypoint: `scripts/btc5m_ctl.sh`
 - Compatibility wrapper (deprecated): `scripts/run_btc_5m_threshold_test.py`
 
 ## Strategy Alignment
-Use this skill when the operator wants to execute a BTC 5m momentum strategy:
-- Entry focus near event close (around 2 minutes left).
-- Confirm meaningful BTC move in the interval (about $70-$100).
-- Prefer direction supported by market skew.
-- Enter with momentum, not against it.
-- Optional small opposite hedge when skew becomes extreme.
+Use this skill when the operator wants to execute a BTC 5m TWAP fair-value strategy:
+- **Settlement-aligned**: Uses Chainlink BTC/USD 60s TWAP (the series Polymarket pays).
+- **Entry**: Pins window-open TWAP. Calculates fair P(TWAP_end ≥ TWAP_open) from live path + residual vol. Trades the cheap side when net edge > costs.
+- **Exit**: Holds to redeem unless bid ≥ hold-EV after fees. No legacy % stops.
+- **Risk**: One ticket per bucket, hard daily loss limit, kill switch.
 
 ## Operational Rules
 - Default is dry-run unless `--execute` is set.

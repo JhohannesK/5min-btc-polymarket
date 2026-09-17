@@ -36,52 +36,70 @@ shared_rules:
 
 profiles:
   conservative:
-    description: "More stable mode: stricter filters and lower per-trade risk."
+    description: "More stable mode: stricter filters and lower per-trade risk. Uses TWAP fair value by default."
     signal:
       trigger_source: "clob_best_ask"
       direction_rule: "follow_stronger_side_over_threshold"
       threshold_price: 0.70
+    twap_fair_value:
+      enabled: true
+      min_edge_bps: 5.0
+      btc_daily_vol_pct: 3.5
+      hold_to_redeem: true
+      description: "Trade the cheap side vs Chainlink TWAP fair when edge > costs. Hold to redeem unless bid >= hold-EV."
     sizing:
       stake_mode: "fixed_or_cap"
       stake_usd: 5
       risk_per_trade_pct_equity: 8
       max_notional_usd: 8
       daily_max_loss_pct: 10
+      daily_max_loss_usd: 50
       max_trades_per_day: 12
     hedge:
-      enabled: true
+      enabled: false
       trigger_side_price_gte: 0.95
       trigger_seconds_left_lte: 45
       hedge_share_of_main_pct: 3
       hedge_notional_usd_min: 1
       hedge_notional_usd_max: 2
+      note: "Hedge not implemented in current TWAP fair-value strategy."
     stop_loss:
-      enabled: true
+      enabled: false
       stop_loss_pct_from_entry: 0.25
+      note: "Legacy stop-loss disabled when hold_to_redeem is true. Exit based on hold-EV instead."
 
   aggressive:
-    description: "Higher frequency and higher risk mode."
+    description: "Higher frequency and higher risk mode. Uses TWAP fair value by default."
     signal:
       trigger_source: "clob_best_ask"
       direction_rule: "follow_stronger_side_over_threshold"
       threshold_price: 0.70
+    twap_fair_value:
+      enabled: true
+      min_edge_bps: 3.0
+      btc_daily_vol_pct: 3.5
+      hold_to_redeem: true
+      description: "Trade the cheap side vs Chainlink TWAP fair when edge > costs. Hold to redeem unless bid >= hold-EV."
     sizing:
       stake_mode: "fixed_or_cap"
       stake_usd: 5
       risk_per_trade_pct_equity: 15
       max_notional_usd: 15
       daily_max_loss_pct: 15
+      daily_max_loss_usd: 50
       max_trades_per_day: 20
     hedge:
-      enabled: true
+      enabled: false
       trigger_side_price_gte: 0.93
       trigger_seconds_left_lte: 50
       hedge_share_of_main_pct: 5
       hedge_notional_usd_min: 1
       hedge_notional_usd_max: 3
+      note: "Hedge not implemented in current TWAP fair-value strategy."
     stop_loss:
-      enabled: true
+      enabled: false
       stop_loss_pct_from_entry: 0.30
+      note: "Legacy stop-loss disabled when hold_to_redeem is true. Exit based on hold-EV instead."
 
 runner_mapping:
   script: "skills/btc-5m-live/scripts/test_btc_5m_session_exit_sl.py"
@@ -98,5 +116,9 @@ runner_mapping:
   example_aggressive_now: ".venv/bin/python scripts/test_btc_5m_session_exit_sl.py --threshold 0.70 --stake-usd 6 --stop-loss-pct 0.30 --exit-before-sec 20 --min-entry-seconds-left 60 --entry-timeout-min 60 --poll-sec 5 --execute"
 
 notes:
-  - "Current 5m runner uses threshold/side-strength logic; impulse filter integration can be extended at strategy layer."
-  - "Entry behavior: continuous CLOB ask monitoring; if UP/DOWN >= threshold, enter on stronger side."
+  - "TWAP fair-value mode (default): Uses Chainlink BTC/USD 60s TWAP (the series Polymarket pays) to estimate fair P(Up). Trades the cheap side vs fair only when net edge (after fees + spread) > min_edge_bps."
+  - "Settlement rule: Up wins iff Chainlink 60s TWAP at window end >= TWAP at window open. Strategy pins window-open TWAP and calculates fair from live TWAP path + residual vol."
+  - "Entry: Trade when book price differs from fair by more than costs (crypto taker fee 7% * p * (1-p) + half-spread). Prefer maker when practical."
+  - "Exit: Hold to redeem (EV = fair_p * $1) unless selling at bid yields higher EV after fees. No legacy % stops on mid prices."
+  - "Risk: One ticket per 5m bucket. Hard daily loss limit in dollars. Kill switch at runtime/.kill with flatten or hold action."
+  - "Legacy threshold mode: Pass --legacy-threshold-mode to use old threshold/side-strength logic (for debug/comparison only)."
