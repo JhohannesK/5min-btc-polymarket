@@ -21,6 +21,7 @@ from btc_5m_twap_fair import (
     estimate_trade_edge,
     calculate_hold_ev
 )
+from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
 
 UTC = dt.timezone.utc
@@ -599,8 +600,14 @@ def main():
                         return
                 
                 # Calculate fair value based on TWAP
+                # For --execute mode, never allow fallback; for dry-run, fallback is OK
                 allow_fallback = not args.execute
-                fair_value = fair_calc.calculate_fair_value(slug, sec_left, args.btc_daily_vol_pct)
+                fair_value = fair_calc.calculate_fair_value(
+                    slug, 
+                    sec_left, 
+                    args.btc_daily_vol_pct,
+                    allow_fallback=allow_fallback
+                )
                 
                 if fair_value is None:
                     report['attempts'].append({
@@ -616,18 +623,23 @@ def main():
                 up_bid, _ = _best_bid_ask(pub.get_order_book(str(up_t)))
                 dn_bid, _ = _best_bid_ask(pub.get_order_book(str(dn_t)))
                 
+                # Calculate actual shares from stake_usd and price
+                # shares = stake_usd / price (where price is the ask we'd buy at)
+                up_shares = args.stake_usd / up_ask if up_ask and up_ask > 0 else 0
+                dn_shares = args.stake_usd / dn_ask if dn_ask and dn_ask > 0 else 0
+                
                 up_edge = estimate_trade_edge(
                     fair_value.p_up,
                     up_ask if up_ask is not None else 0.99,
                     up_bid if up_bid is not None else 0.01,
-                    shares=args.stake_usd
+                    shares=up_shares
                 ) if up_ask is not None else None
                 
                 dn_edge = estimate_trade_edge(
                     fair_value.p_down,
                     dn_ask if dn_ask is not None else 0.99,
                     dn_bid if dn_bid is not None else 0.01,
-                    shares=args.stake_usd
+                    shares=dn_shares
                 ) if dn_ask is not None else None
                 
                 report['attempts'].append({
@@ -767,17 +779,27 @@ def main():
         # Hold-to-redeem mode: only exit if selling is better EV than holding
         report['exit_mode'] = 'hold_to_redeem_ev'
         close_reason = None
+        held_to_redeem = False
         
         while True:
             now = time.time()
             if now >= (end_ts - args.exit_before_sec):
                 close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
+                # If exiting very close to settlement, mark as held to redeem
+                if args.exit_before_sec <= 20:
+                    held_to_redeem = True
                 break
             
             # Get current fair value and CLOB bid
             try:
                 sec_left = max(0, end_ts - now)
-                fair_value = fair_calc.calculate_fair_value(slug, sec_left, args.btc_daily_vol_pct)
+                allow_fallback = not args.execute
+                fair_value = fair_calc.calculate_fair_value(
+                    slug, 
+                    sec_left, 
+                    args.btc_daily_vol_pct,
+                    allow_fallback=allow_fallback
+                )
                 if fair_value is None:
                     time.sleep(args.poll_sec)
                     continue
@@ -1037,6 +1059,20 @@ def main():
     # Update state tracker with close
     pnl_for_tracker = pnl if pnl is not None else 0.0
     state_tracker.close_ticket(opened['bucket'], pnl_for_tracker, close_status)
+    
+    # Log TWAP settlement if position was held to redeem
+    if args.hold_to_redeem and use_fair_value and fair_calc is not None:
+        window_open_twap = fair_calc.get_window_open_twap(opened['market_slug'])
+        if window_open_twap is not None and held_to_redeem:
+            try:
+                settle_result = log_twap_settle(
+                    opened['market_slug'],
+                    window_open_twap,
+                    opened['side']
+                )
+                report['twap_settlement'] = settle_result
+            except Exception as e:
+                report['twap_settlement_error'] = str(e)
     
     # Daily summary at end
     report['daily_summary_end'] = state_tracker.get_daily_summary()
