@@ -23,6 +23,13 @@ from btc_5m_twap_fair import (
 )
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
+from btc_5m_maker_pilot import (
+    MakerPilotConfig,
+    MakerPilotEngine,
+    SideBook,
+    format_maker_pilot_report,
+    summarize_maker_pilot,
+)
 
 UTC = dt.timezone.utc
 
@@ -169,6 +176,77 @@ def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://c
     return up_ask, dn_ask, picked_spread
 
 
+def clob_side_books(
+    up_token: str,
+    down_token: str,
+    clob_base: str = 'https://clob.polymarket.com',
+) -> tuple[SideBook, SideBook]:
+    pub = ClobClient(host=clob_base, chain_id=POLYGON)
+    up_raw = pub.get_order_book(str(up_token))
+    dn_raw = pub.get_order_book(str(down_token))
+    up_bid, up_ask = _best_bid_ask(up_raw)
+    dn_bid, dn_ask = _best_bid_ask(dn_raw)
+    return (
+        SideBook(side='UP', token_id=str(up_token), best_bid=up_bid, best_ask=up_ask),
+        SideBook(side='DOWN', token_id=str(down_token), best_bid=dn_bid, best_ask=dn_ask),
+    )
+
+
+def _min_spread(up_book: SideBook, dn_book: SideBook) -> Optional[float]:
+    spreads = [s for s in (up_book.spread, dn_book.spread) if s is not None]
+    if not spreads:
+        return None
+    return min(spreads)
+
+
+def run_maker_pilot_tick(
+    engine: MakerPilotEngine,
+    report: dict[str, Any],
+    *,
+    now: float,
+    fair_signal: str,
+    up_book: SideBook,
+    down_book: SideBook,
+    stake_usd: float,
+    execute: bool,
+    rtds_ready: bool,
+    bucket: int,
+    slug: str,
+    seconds_left: Optional[float],
+) -> list[dict[str, Any]]:
+    if not engine.config.enabled:
+        return []
+    events = engine.on_tick(
+        now=now,
+        fair_signal=fair_signal,
+        up_book=up_book,
+        down_book=down_book,
+        stake_usd=stake_usd,
+        execute=execute,
+        rtds_ready=rtds_ready,
+        creds_ready=False,
+        bucket=bucket,
+        market_slug=slug,
+        seconds_left=seconds_left,
+    )
+    if events:
+        report.setdefault('maker_pilot_events', []).extend(events)
+        report['attempts'].append({
+            'ts': ts_utc(),
+            'slug': slug,
+            'status': 'maker_pilot_tick',
+            'events': [e.get('event') for e in events],
+            'reasons': [e.get('reason') for e in events if e.get('reason')],
+        })
+    return events
+
+
+def attach_maker_pilot_summary(report: dict[str, Any], engine: MakerPilotEngine) -> None:
+    summary = summarize_maker_pilot(engine.events, engine.quotes)
+    report['maker_pilot'] = summary
+    report['maker_pilot_report'] = format_maker_pilot_report(summary)
+
+
 def clob_best_bid(token_id: str, clob_base: str = 'https://clob.polymarket.com') -> Optional[float]:
     pub = ClobClient(host=clob_base, chain_id=POLYGON)
     book = pub.get_order_book(str(token_id))
@@ -310,6 +388,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 5.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'maker_pilot': MakerPilotConfig().as_public_dict(),
         },
         'aggressive': {
             'threshold': 0.70,
@@ -323,6 +402,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 3.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'maker_pilot': MakerPilotConfig().as_public_dict(),
         },
     }
     
@@ -340,7 +420,10 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             stop_loss = profile_data.get('stop_loss', {})
             session_timing = config.get('shared_rules', {}).get('session_timing', {})
             twap_fair = profile_data.get('twap_fair_value', {})
-            
+            shared_mp = config.get('shared_rules', {}).get('maker_pilot', {}) or {}
+            profile_mp = profile_data.get('maker_pilot', {}) or {}
+            maker_pilot = {**shared_mp, **profile_mp}
+
             profiles[profile_name] = {
                 'threshold': signal.get('threshold_price', 0.70),
                 'stake_usd': sizing.get('stake_usd', 5.0),
@@ -353,6 +436,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
                 'min_edge_bps': twap_fair.get('min_edge_bps', 5.0),
                 'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
                 'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
+                'maker_pilot': maker_pilot,
             }
         
         return profiles if profiles else fallback_profiles
@@ -387,6 +471,11 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
     if args.hold_to_redeem is None:
         args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
+    args.maker_pilot_cfg = dict(prof.get('maker_pilot') or {})
+    if getattr(args, 'maker_pilot', False):
+        args.maker_pilot_cfg['enabled'] = True
+        args.maker_pilot_cfg['shadow'] = True
+        args.maker_pilot_cfg['live_execute'] = False
     return args
 
 
@@ -440,6 +529,11 @@ def main():
     ap.add_argument('--btc-daily-vol-pct', type=float, default=None, help='BTC daily vol % for fair value calc (default 3.5)')
     ap.add_argument('--hold-to-redeem', type=bool, default=None, help='Hold to redeem unless bid >= hold-EV (default True)')
     ap.add_argument('--legacy-threshold-mode', action='store_true', help='Use legacy threshold-only mode (for debug/comparison)')
+    ap.add_argument(
+        '--maker-pilot',
+        action='store_true',
+        help='Enable W6 maker/post-only shadow pilot. Forces shadow; does not enable live execute.',
+    )
     ap.add_argument('--execute', action='store_true')
     args = apply_profile(ap.parse_args())
 
@@ -460,6 +554,10 @@ def main():
         max_trades_per_day=20
     )
 
+    mp_cfg = MakerPilotConfig.from_mapping(getattr(args, 'maker_pilot_cfg', None))
+    maker_engine = MakerPilotEngine(mp_cfg)
+    maker_on = mp_cfg.enabled and use_fair_value
+
     report: dict[str, Any] = {
         'started_at': ts_utc(),
         'params': {
@@ -479,8 +577,10 @@ def main():
             'btc_daily_vol_pct': args.btc_daily_vol_pct if use_fair_value else None,
             'hold_to_redeem': args.hold_to_redeem,
             'legacy_threshold_mode': args.legacy_threshold_mode,
+            'maker_pilot': mp_cfg.as_public_dict(),
         },
         'attempts': [],
+        'maker_pilot_events': [],
     }
 
     deadline = time.time() + args.entry_timeout_min * 60
@@ -501,6 +601,7 @@ def main():
                 }
                 report['result'] = f'kill_switch_{kill_action}'
                 report['finished_at'] = ts_utc()
+                attach_maker_pilot_summary(report, maker_engine)
                 print(json.dumps(report, ensure_ascii=False, indent=2))
                 return
             
@@ -539,8 +640,35 @@ def main():
                 time.sleep(args.poll_sec)
                 continue
 
-            # Do not open if less than N seconds remain in current slot.
+            # CLOB books (bid+ask) for maker shadow and taker edge.
+            try:
+                up_book, dn_book = clob_side_books(up_t, dn_t)
+            except Exception as e:
+                report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
+                time.sleep(args.poll_sec)
+                continue
+
+            up_ask, dn_ask = up_book.best_ask, dn_book.best_ask
+            up_bid, dn_bid = up_book.best_bid, dn_book.best_bid
+            min_spread = _min_spread(up_book, dn_book)
+
+            # Too late to enter: cancel any resting shadow quote, do not post.
             if sec_left < args.min_entry_seconds_left:
+                if maker_on:
+                    run_maker_pilot_tick(
+                        maker_engine,
+                        report,
+                        now=time.time(),
+                        fair_signal='unavailable',
+                        up_book=up_book,
+                        down_book=dn_book,
+                        stake_usd=args.stake_usd,
+                        execute=args.execute,
+                        rtds_ready=False,
+                        bucket=current_bucket,
+                        slug=slug,
+                        seconds_left=sec_left,
+                    )
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
@@ -548,14 +676,6 @@ def main():
                     'seconds_left': sec_left,
                     'min_entry_seconds_left': args.min_entry_seconds_left,
                 })
-                time.sleep(args.poll_sec)
-                continue
-
-            # CLOB-based trigger price (best ask of selected side), not Gamma outcomePrices.
-            try:
-                up_ask, dn_ask, min_spread = clob_side_prices(up_t, dn_t)
-            except Exception as e:
-                report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
                 time.sleep(args.poll_sec)
                 continue
 
@@ -574,6 +694,31 @@ def main():
             # Enforce spread gate: skip if spread is too wide
             max_spread = 0.03
             if min_spread is not None and min_spread > max_spread:
+                if maker_on:
+                    wide_sig = 'unavailable'
+                    if fair_calc is not None:
+                        try:
+                            fv_wide = fair_calc.calculate_fair_value(
+                                slug, sec_left, args.btc_daily_vol_pct, allow_fallback=not args.execute
+                            )
+                            if fv_wide is not None:
+                                wide_sig = fv_wide.edge_signal
+                        except Exception:
+                            pass
+                    run_maker_pilot_tick(
+                        maker_engine,
+                        report,
+                        now=time.time(),
+                        fair_signal=wide_sig,
+                        up_book=up_book,
+                        down_book=dn_book,
+                        stake_usd=args.stake_usd,
+                        execute=args.execute,
+                        rtds_ready=bool(args.execute),
+                        bucket=current_bucket,
+                        slug=slug,
+                        seconds_left=sec_left,
+                    )
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
@@ -596,6 +741,7 @@ def main():
                         report['rtds_check_failed'] = str(e)
                         report['result'] = 'rtds_required_for_execute'
                         report['finished_at'] = ts_utc()
+                        attach_maker_pilot_summary(report, maker_engine)
                         print(json.dumps(report, ensure_ascii=False, indent=2))
                         return
                 
@@ -610,6 +756,21 @@ def main():
                 )
                 
                 if fair_value is None:
+                    if maker_on:
+                        run_maker_pilot_tick(
+                            maker_engine,
+                            report,
+                            now=time.time(),
+                            fair_signal='unavailable',
+                            up_book=up_book,
+                            down_book=dn_book,
+                            stake_usd=args.stake_usd,
+                            execute=args.execute,
+                            rtds_ready=bool(args.execute),
+                            bucket=current_bucket,
+                            slug=slug,
+                            seconds_left=sec_left,
+                        )
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -619,12 +780,7 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
                 
-                # Evaluate edge for both sides
-                up_bid, _ = _best_bid_ask(pub.get_order_book(str(up_t)))
-                dn_bid, _ = _best_bid_ask(pub.get_order_book(str(dn_t)))
-                
-                # Calculate actual shares from stake_usd and price
-                # shares = stake_usd / price (where price is the ask we'd buy at)
+                # Bids already loaded with asks via clob_side_books.
                 up_shares = args.stake_usd / up_ask if up_ask and up_ask > 0 else 0
                 dn_shares = args.stake_usd / dn_ask if dn_ask and dn_ask > 0 else 0
                 
@@ -657,6 +813,24 @@ def main():
                     'dn_edge_bps': dn_edge['net_edge_bps'] if dn_edge else None,
                     'seconds_left': sec_left,
                 })
+
+                if maker_on:
+                    run_maker_pilot_tick(
+                        maker_engine,
+                        report,
+                        now=time.time(),
+                        fair_signal=fair_value.edge_signal,
+                        up_book=up_book,
+                        down_book=dn_book,
+                        stake_usd=args.stake_usd,
+                        execute=args.execute,
+                        rtds_ready=bool(args.execute),
+                        bucket=current_bucket,
+                        slug=slug,
+                        seconds_left=sec_left,
+                    )
+                    time.sleep(args.poll_sec)
+                    continue
                 
                 # Select side with best positive edge
                 candidates: list[tuple[str, float, dict]] = []
@@ -761,7 +935,11 @@ def main():
 
     if not opened:
         report['finished_at'] = ts_utc()
-        report['result'] = 'no_entry_timeout'
+        attach_maker_pilot_summary(report, maker_engine)
+        if maker_on:
+            report['result'] = 'maker_pilot_shadow_complete'
+        else:
+            report['result'] = 'no_entry_timeout'
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 

@@ -16,6 +16,13 @@ from btc_5m_twap_fair import (
     estimate_trade_edge,
     calculate_hold_ev
 )
+from btc_5m_maker_pilot import (
+    MakerPilotConfig,
+    MakerPilotEngine,
+    SideBook,
+    format_maker_pilot_report,
+    summarize_maker_pilot,
+)
 
 
 def main():
@@ -88,12 +95,35 @@ def main():
         print(f"   Fair={fair_p:.2f}, Bid={bid:.2f}: {hold_ev['recommendation']} "
               f"(EV diff=${hold_ev['ev_diff']:.3f})")
     
+    print("\n8. W6 maker/post-only shadow (no live orders)...")
+    cfg = MakerPilotConfig(enabled=True, shadow=True, gtd_ttl_sec=15.0)
+    eng = MakerPilotEngine(cfg)
+    up = SideBook(side="UP", token_id="up", best_bid=0.44, best_ask=0.46)
+    dn = SideBook(side="DOWN", token_id="dn", best_bid=0.54, best_ask=0.56)
+    eng.on_tick(now=1000.0, fair_signal="up_favored", up_book=up, down_book=dn, stake_usd=5.0, bucket=1)
+    eng.on_tick(
+        now=1002.0,
+        fair_signal="down_favored",
+        up_book=up,
+        down_book=dn,
+        stake_usd=5.0,
+        bucket=1,
+    )
+    summary = summarize_maker_pilot(eng.events, eng.quotes)
+    print(format_maker_pilot_report(summary))
+    if summary["cancels_fair_flip"] != 1 or summary["live_posts_attempted"] != 0:
+        print("   ❌ Maker shadow cancel-on-flip / live-stub check failed")
+        return 1
+    print("   ✓ Shadow post + cancel on TWAP fair flip")
+    print("   ✓ Live path stubbed (0 live posts)")
+    
     print("\n=== Verification Complete ===")
     print("✓ All components working without live Polymarket credentials")
     print("✓ TWAP tracker operational (using spot fallback)")
     print("✓ Fair value calculation functional")
     print("✓ Edge estimation working")
     print("✓ Hold-EV calculation working")
+    print("✓ W6 maker shadow path working (cancel-on-flip, live stubbed)")
     print("\n⚠️  PRODUCTION REQUIREMENTS:")
     print("   - Connect to RTDS topic: crypto_prices_twap_sixty")
     print("   - Filter: {\"symbol\":\"btc/usd\"}")
