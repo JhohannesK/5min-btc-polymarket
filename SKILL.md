@@ -10,6 +10,7 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Ch
 - Core runner: `src/live/pm_live_trade_runner.py`
 - Canonical skill runner: `scripts/test_btc_5m_session_exit_sl.py`
 - TWAP fair value module: `scripts/btc_5m_twap_fair.py`
+- Entry timing (W4): `scripts/btc_5m_entry_timing.py`
 - State tracker: `scripts/btc_5m_state_tracker.py`
 - Skill control entrypoint: `scripts/btc5m_ctl.sh`
 - Compatibility wrapper (deprecated): `scripts/run_btc_5m_threshold_test.py`
@@ -17,7 +18,7 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Ch
 ## Strategy Alignment
 Use this skill when the operator wants to execute a BTC 5m TWAP fair-value strategy:
 - **Settlement-aligned**: Uses Chainlink BTC/USD 60s TWAP (the series Polymarket pays).
-- **Entry**: Pins window-open TWAP. Calculates fair P(TWAP_end ≥ TWAP_open) from live path + residual vol. Trades the cheap side when net edge > costs.
+- **Entry**: Pins window-open TWAP. W3 projected-final-TWAP: P(Up) from the incomplete 60s path + remaining settle window (not spot momentum). Default W4 window T-240 to T-45. Trades the cheap side when net edge > costs.
 - **Exit**: Holds to redeem unless bid ≥ hold-EV after fees. No legacy % stops.
 - **Risk**: One ticket per bucket, hard daily loss limit, kill switch.
 

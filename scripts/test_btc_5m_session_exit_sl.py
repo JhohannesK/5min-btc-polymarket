@@ -21,6 +21,10 @@ from btc_5m_twap_fair import (
     estimate_trade_edge,
     calculate_hold_ev
 )
+from btc_5m_entry_timing import (
+    entry_timing_from_mapping,
+    evaluate_entry_timing,
+)
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
 
@@ -148,6 +152,24 @@ def _best_bid_ask(book) -> tuple[Optional[float], Optional[float]]:
         if best_ask is None or p < best_ask:
             best_ask = p
     return best_bid, best_ask
+
+
+def _best_ask_notional(book) -> float:
+    """Top-of-book ask notional in USD (price * size). 0 if the book is empty."""
+    asks = getattr(book, 'asks', []) or []
+    best_p = None
+    best_sz = 0.0
+    for a in asks:
+        p = float(getattr(a, 'price', 0) or 0)
+        if p <= 0:
+            continue
+        sz = float(getattr(a, 'size', 0) or 0)
+        if best_p is None or p < best_p:
+            best_p = p
+            best_sz = sz
+    if best_p is None:
+        return 0.0
+    return best_p * best_sz
 
 
 def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com') -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -310,6 +332,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 5.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'entry_timing': {},
         },
         'aggressive': {
             'threshold': 0.70,
@@ -323,6 +346,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 3.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'entry_timing': {},
         },
     }
     
@@ -340,6 +364,8 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             stop_loss = profile_data.get('stop_loss', {})
             session_timing = config.get('shared_rules', {}).get('session_timing', {})
             twap_fair = profile_data.get('twap_fair_value', {})
+            entry_timing = dict(session_timing.get('entry_timing') or {})
+            entry_timing.update(twap_fair.get('entry_timing') or {})
             
             profiles[profile_name] = {
                 'threshold': signal.get('threshold_price', 0.70),
@@ -353,6 +379,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
                 'min_edge_bps': twap_fair.get('min_edge_bps', 5.0),
                 'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
                 'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
+                'entry_timing': entry_timing,
             }
         
         return profiles if profiles else fallback_profiles
@@ -387,6 +414,7 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
     if args.hold_to_redeem is None:
         args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
+    args.entry_timing_cfg = entry_timing_from_mapping(prof.get('entry_timing'))
     return args
 
 
@@ -479,6 +507,12 @@ def main():
             'btc_daily_vol_pct': args.btc_daily_vol_pct if use_fair_value else None,
             'hold_to_redeem': args.hold_to_redeem,
             'legacy_threshold_mode': args.legacy_threshold_mode,
+            'entry_timing': {
+                'window_max_seconds_left': args.entry_timing_cfg.window_max_seconds_left,
+                'window_min_seconds_left': args.entry_timing_cfg.window_min_seconds_left,
+                'soft_skip_open_sec': args.entry_timing_cfg.soft_skip_open_sec,
+                'hard_skip_last_sec': args.entry_timing_cfg.hard_skip_last_sec,
+            },
         },
         'attempts': [],
     }
@@ -539,8 +573,8 @@ def main():
                 time.sleep(args.poll_sec)
                 continue
 
-            # Do not open if less than N seconds remain in current slot.
-            if sec_left < args.min_entry_seconds_left:
+            # Legacy blunt late-entry skip. Fair-value path uses W4 timing instead.
+            if (not use_fair_value) and sec_left < args.min_entry_seconds_left:
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
@@ -620,8 +654,13 @@ def main():
                     continue
                 
                 # Evaluate edge for both sides
-                up_bid, _ = _best_bid_ask(pub.get_order_book(str(up_t)))
-                dn_bid, _ = _best_bid_ask(pub.get_order_book(str(dn_t)))
+                pub = ClobClient(host='https://clob.polymarket.com', chain_id=POLYGON)
+                up_book = pub.get_order_book(str(up_t))
+                dn_book = pub.get_order_book(str(dn_t))
+                up_bid, _ = _best_bid_ask(up_book)
+                dn_bid, _ = _best_bid_ask(dn_book)
+                up_ask_notional = _best_ask_notional(up_book)
+                dn_ask_notional = _best_ask_notional(dn_book)
                 
                 # Calculate actual shares from stake_usd and price
                 # shares = stake_usd / price (where price is the ask we'd buy at)
@@ -650,7 +689,15 @@ def main():
                     'fair_p_down': fair_value.p_down,
                     'window_open_twap': fair_value.window_open_twap,
                     'current_twap': fair_value.current_twap,
+                    'projected_final_twap': fair_value.projected_final_twap,
+                    'locked_frac': fair_value.locked_frac,
+                    'remaining_frac': fair_value.remaining_frac,
+                    'fair_model': fair_value.model,
                     'edge_signal': fair_value.edge_signal,
+                    'source': fair_value.source,
+                    'source_ts': fair_value.source_ts,
+                    'receipt_ts': fair_value.receipt_ts,
+                    'decision_ts': fair_value.decision_ts,
                     'up_ask': up_ask,
                     'dn_ask': dn_ask,
                     'up_edge_bps': up_edge['net_edge_bps'] if up_edge else None,
@@ -677,16 +724,67 @@ def main():
                     })
                     time.sleep(args.poll_sec)
                     continue
-                
-                side, best_edge_bps, edge_details = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+
+                timed: list[tuple[str, float, dict, Any]] = []
+                for cand_side, cand_edge_bps, cand_details in candidates:
+                    fair_p_side = fair_value.p_up if cand_side == 'UP' else fair_value.p_down
+                    notional = up_ask_notional if cand_side == 'UP' else dn_ask_notional
+                    timing = evaluate_entry_timing(
+                        seconds_left=sec_left,
+                        fair_p=fair_p_side,
+                        ask=cand_details['book_ask'],
+                        net_edge_bps=cand_edge_bps,
+                        min_edge_bps=args.min_edge_bps,
+                        top_ask_notional_usd=notional,
+                        cfg=args.entry_timing_cfg,
+                    )
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'entry_timing_check',
+                        'side': cand_side,
+                        'allow': timing.allow,
+                        'reason': timing.reason,
+                        'zone': timing.zone,
+                        'seconds_left': sec_left,
+                        'abs_fair_dev': timing.abs_fair_dev,
+                        'top_ask_notional_usd': notional,
+                    })
+                    if timing.allow:
+                        timed.append((cand_side, cand_edge_bps, cand_details, timing))
+
+                if not timed:
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_entry_timing',
+                        'seconds_left': sec_left,
+                    })
+                    time.sleep(args.poll_sec)
+                    continue
+
+                side, best_edge_bps, edge_details, timing = sorted(timed, key=lambda x: x[1], reverse=True)[0]
                 trigger_price = edge_details['book_ask']
                 report['entry_edge_details'] = edge_details
+                report['entry_timing'] = {
+                    'reason': timing.reason,
+                    'zone': timing.zone,
+                    'seconds_left': sec_left,
+                }
                 report['entry_fair_value'] = {
                     'p_up': fair_value.p_up,
                     'p_down': fair_value.p_down,
                     'window_open_twap': fair_value.window_open_twap,
                     'current_twap': fair_value.current_twap,
+                    'projected_final_twap': fair_value.projected_final_twap,
+                    'locked_frac': fair_value.locked_frac,
+                    'remaining_frac': fair_value.remaining_frac,
+                    'model': fair_value.model,
                     'edge_signal': fair_value.edge_signal,
+                    'source': fair_value.source,
+                    'source_ts': fair_value.source_ts,
+                    'receipt_ts': fair_value.receipt_ts,
+                    'decision_ts': fair_value.decision_ts,
                 }
             else:
                 # Legacy threshold-only mode

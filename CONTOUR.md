@@ -3,6 +3,10 @@
 ## Canonical execution path
 - Strategy runner (canonical):
   - `scripts/test_btc_5m_session_exit_sl.py`
+- TWAP fair value (W3 projected-final-TWAP):
+  - `scripts/btc_5m_twap_fair.py`
+- Entry timing (W4):
+  - `scripts/btc_5m_entry_timing.py`
 - Unified control entrypoint:
   - `scripts/btc5m_ctl.sh` (`start|status|stop|report|logs`)
 - Compatibility wrapper (deprecated path, forwards to canonical):

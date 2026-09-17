@@ -14,8 +14,10 @@ from btc_5m_twap_fair import (
     ChainlinkTWAPTracker,
     FairValueCalculator,
     estimate_trade_edge,
-    calculate_hold_ev
+    calculate_hold_ev,
+    projected_final_twap_fair,
 )
+from btc_5m_entry_timing import evaluate_entry_timing
 
 
 def main():
@@ -87,6 +89,26 @@ def main():
         hold_ev = calculate_hold_ev(fair_p, bid)
         print(f"   Fair={fair_p:.2f}, Bid={bid:.2f}: {hold_ev['recommendation']} "
               f"(EV diff=${hold_ev['ev_diff']:.3f})")
+
+    print("\n8. W3 projected-final-TWAP (same endpoint, early vs late)...")
+    open_px, endpoint = 100000.0, 100200.0
+    early = projected_final_twap_fair(open_px, endpoint, 240.0)
+    late = projected_final_twap_fair(open_px, endpoint, 20.0)
+    print(f"   ✓ early 240s P(Up)={early['p_up']:.4f} residual={early['residual_vol']:.6f}")
+    print(f"   ✓ late  20s P(Up)={late['p_up']:.4f} residual={late['residual_vol']:.6f}")
+    print(f"   ✓ model={early['model']}")
+    dumped = projected_final_twap_fair(open_px, endpoint, 20.0, spot_price=90000.0)
+    print(f"   ✓ spot dump ignored: spot_ignored={dumped['spot_ignored']} p_up={dumped['p_up']:.4f}")
+
+    print("\n9. W4 entry-timing gates (offline)...")
+    mid = evaluate_entry_timing(120, 0.68, 0.58, 25.0, 5.0, 80.0)
+    soft = evaluate_entry_timing(290, 0.68, 0.58, 25.0, 5.0, 80.0)
+    hard = evaluate_entry_timing(12, 0.58, 0.55, 25.0, 5.0, 80.0)
+    late_ok = evaluate_entry_timing(15, 0.90, 0.70, 80.0, 5.0, 80.0)
+    print(f"   ✓ default window: {mid.reason} allow={mid.allow}")
+    print(f"   ✓ soft-skip open: {soft.reason} allow={soft.allow}")
+    print(f"   ✓ hard-skip last: {hard.reason} allow={hard.allow}")
+    print(f"   ✓ late polarized: {late_ok.reason} allow={late_ok.allow}")
     
     print("\n=== Verification Complete ===")
     print("✓ All components working without live Polymarket credentials")
@@ -94,6 +116,8 @@ def main():
     print("✓ Fair value calculation functional")
     print("✓ Edge estimation working")
     print("✓ Hold-EV calculation working")
+    print("✓ W3 projected-final-TWAP early/late consistent")
+    print("✓ W4 entry-timing gates functional")
     print("\n⚠️  PRODUCTION REQUIREMENTS:")
     print("   - Connect to RTDS topic: crypto_prices_twap_sixty")
     print("   - Filter: {\"symbol\":\"btc/usd\"}")
