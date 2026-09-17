@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from btc_5m_twap_fair import ChainlinkTWAPTracker
 
 
-def log_twap_settle(market_slug: str, window_open_twap: float, side: str):
+def log_twap_settle(market_slug: str, window_open_twap: float, side: str, allow_fallback: bool = True):
     """
     Log TWAP settlement for a market.
     
@@ -22,11 +22,12 @@ def log_twap_settle(market_slug: str, window_open_twap: float, side: str):
         market_slug: Market identifier
         window_open_twap: Pinned TWAP at window open
         side: Position side ('UP' or 'DOWN')
+        allow_fallback: If False, raises if RTDS not configured (for --execute mode)
     """
     tracker = ChainlinkTWAPTracker()
     
     try:
-        final_snapshot = tracker.get_current_twap(allow_fallback=True)
+        final_snapshot = tracker.get_current_twap(allow_fallback=allow_fallback)
         if final_snapshot is None:
             print(f"[TWAP_SETTLE_ERROR] Could not fetch final TWAP for {market_slug}")
             return

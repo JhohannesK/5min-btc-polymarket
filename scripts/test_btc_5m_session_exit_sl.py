@@ -1147,10 +1147,12 @@ def main():
         window_open_twap = fair_calc.get_window_open_twap(opened['market_slug'])
         if window_open_twap is not None and held_to_redeem:
             try:
+                allow_fallback = not args.execute
                 settle_result = log_twap_settle(
                     opened['market_slug'],
                     window_open_twap,
-                    opened['side']
+                    opened['side'],
+                    allow_fallback=allow_fallback
                 )
                 report['twap_settlement'] = settle_result
             except Exception as e:

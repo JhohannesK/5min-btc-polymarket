@@ -36,9 +36,10 @@
 
 **Current Implementation**:
 - `ChainlinkTWAPTracker` in `scripts/btc_5m_twap_fair.py`
-- Falls back to averaging spot prices from Binance/Coinbase
-- Marks source as `"spot_estimate_60s"` with `windowSeconds=60`
+- Falls back to averaging spot prices from Binance/Coinbase (dry-run only)
+- Marks source as `"spot_fallback_dry_run_only"` with `windowSeconds=60`
 - Logs `[TWAP_PIN]` and `[TWAP_CALC]` with windowSeconds for verification
+- RTDS enforced in `--execute` mode: spot fallback disabled for live trading
 
 **Production Requirements**:
 See `RTDS_INTEGRATION.md` for complete RTDS connection details, logging requirements, and ship-blocker checklist.
