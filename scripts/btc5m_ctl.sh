@@ -20,7 +20,7 @@ mkdir -p "$RUNTIME_DIR"
 usage() {
   cat <<'EOF'
 Usage:
-  btc5m_ctl.sh start [--profile conservative|aggressive] [--entry-timeout-min N] [--stake-usd N] [--threshold N] [--poll-sec N] [--close-retry-max N] [--close-retry-delay-sec N]
+  btc5m_ctl.sh start [--profile conservative|aggressive] [--entry-timeout-min N] [--stake-usd N] [--threshold N] [--poll-sec N] [--close-retry-max N] [--close-retry-delay-sec N] [--execute]
   btc5m_ctl.sh status
   btc5m_ctl.sh stop
   btc5m_ctl.sh report [--limit N]
@@ -29,6 +29,7 @@ Usage:
 Notes:
 - Runs in isolated skill runtime: skills/btc-5m-live/runtime
 - Uses auth/env from pm-hl-conservative-plus-repo/.env
+- Defaults to dry-run mode; pass --execute for live trading
 EOF
 }
 
@@ -50,6 +51,7 @@ cmd_start() {
   local poll_sec="2"
   local close_retry_max="30"
   local close_retry_delay_sec="2"
+  local execute_flag=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -60,6 +62,7 @@ cmd_start() {
       --poll-sec) poll_sec="$2"; shift 2;;
       --close-retry-max) close_retry_max="$2"; shift 2;;
       --close-retry-delay-sec) close_retry_delay_sec="$2"; shift 2;;
+      --execute) execute_flag="--execute"; shift;;
       *) echo "Unknown arg: $1"; usage; exit 2;;
     esac
   done
@@ -74,9 +77,10 @@ cmd_start() {
   log="$RUNTIME_DIR/btc5m_${profile}_${ts}.log"
 
   local -a runner_cmd
-  runner_cmd=("$VENV_PY" "$RUNNER" "--profile" "$profile" "--entry-timeout-min" "$entry_timeout_min" "--poll-sec" "$poll_sec" "--close-retry-max" "$close_retry_max" "--close-retry-delay-sec" "$close_retry_delay_sec" "--execute")
+  runner_cmd=("$VENV_PY" "$RUNNER" "--profile" "$profile" "--entry-timeout-min" "$entry_timeout_min" "--poll-sec" "$poll_sec" "--close-retry-max" "$close_retry_max" "--close-retry-delay-sec" "$close_retry_delay_sec")
   [[ -n "$stake_usd" ]] && runner_cmd+=("--stake-usd" "$stake_usd")
   [[ -n "$threshold" ]] && runner_cmd+=("--threshold" "$threshold")
+  [[ -n "$execute_flag" ]] && runner_cmd+=("$execute_flag")
 
   (
     if [[ -f "$ENV_FILE" ]]; then
@@ -141,13 +145,29 @@ cmd_stop() {
   fi
   local pid
   pid="$(cat "$PIDFILE")"
+  
+  # Graceful shutdown: SIGTERM first, wait up to 10 seconds
+  echo "sending SIGTERM to pid=$pid"
   kill "$pid" || true
+  
+  local waited=0
+  local max_wait=10
+  while [ $waited -lt $max_wait ]; do
+    if ! ps -p "$pid" >/dev/null 2>&1; then
+      rm -f "$PIDFILE"
+      echo "stopped gracefully pid=$pid"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  
+  # Still running after 10s: use SIGKILL as last resort
+  echo "process still running after ${max_wait}s, sending SIGKILL"
+  kill -9 "$pid" || true
   sleep 1
-  if ps -p "$pid" >/dev/null 2>&1; then
-    kill -9 "$pid" || true
-  fi
   rm -f "$PIDFILE"
-  echo "stopped pid=$pid"
+  echo "force stopped pid=$pid"
 }
 
 cmd_report() {

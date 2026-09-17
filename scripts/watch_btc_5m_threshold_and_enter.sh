@@ -30,10 +30,10 @@ while true; do
   out=$(cd "$REPO" && .venv/bin/python "$PY" --profile conservative --threshold "$THRESHOLD" --stake-usd "$STAKE" --entry-timeout-min 8 --poll-sec 2 --execute 2>&1 || true)
   echo "$out" >> "$LOG"
 
-  # if decision enter and runner returned success/matched -> stop
-  if echo "$out" | grep -q '"decision": "enter"'; then
-    if echo "$out" | grep -q '"success": true\|"status": "matched"\|"order_post_result"'; then
-      echo "[$(date -u +%FT%TZ)] entry attempted, stopping watcher" | tee -a "$LOG"
+  # Check for actual entry success: opened position with matched order
+  if echo "$out" | grep -q '"opened"'; then
+    if echo "$out" | grep -q '"status": "matched"'; then
+      echo "[$(date -u +%FT%TZ)] entry matched, stopping watcher" | tee -a "$LOG"
       echo "entered_at=$(date -u +%FT%TZ)" > "$STATE"
       exit 0
     fi

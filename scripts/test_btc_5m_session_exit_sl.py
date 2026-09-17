@@ -8,6 +8,7 @@ import time
 from typing import Any, Optional
 from pathlib import Path
 
+import yaml
 import requests
 
 from py_clob_client.client import ClobClient
@@ -232,8 +233,10 @@ def run_open(repo: str, slug: str, side: str, stake: float, execute: bool) -> tu
     if execute:
         cmd.append('--execute')
     env = os.environ.copy()
-    env.setdefault('PM_MAX_SPREAD', '1')
-    env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '0')
+    # Set reasonable defaults for safety guards instead of disabling them
+    # Only override if not already set in environment
+    env.setdefault('PM_MAX_SPREAD', '0.05')
+    env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '10')
     env.setdefault('PM_ORDER_TYPE', 'FAK')
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, env=env)
     out = (p.stdout or '') + '\n' + (p.stderr or '')
@@ -281,26 +284,61 @@ def get_side_price_from_slug(slug: str, side: str) -> Optional[float]:
         return None
 
 
-PROFILES: dict[str, dict[str, Any]] = {
-    'conservative': {
-        'threshold': 0.70,
-        'stake_usd': 5.0,
-        'stop_loss_pct': 0.25,
-        'exit_before_sec': 20,
-        'min_entry_seconds_left': 60,
-        'entry_timeout_min': 60,
-        'poll_sec': 5.0,
-    },
-    'aggressive': {
-        'threshold': 0.70,
-        'stake_usd': 5.0,
-        'stop_loss_pct': 0.30,
-        'exit_before_sec': 20,
-        'min_entry_seconds_left': 60,
-        'entry_timeout_min': 60,
-        'poll_sec': 5.0,
-    },
-}
+def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
+    """Load profiles from config/btc_5m_profiles.yaml, with fallback to hardcoded defaults."""
+    config_path = Path(__file__).parent.parent / 'config' / 'btc_5m_profiles.yaml'
+    
+    fallback_profiles = {
+        'conservative': {
+            'threshold': 0.70,
+            'stake_usd': 5.0,
+            'stop_loss_pct': 0.25,
+            'exit_before_sec': 20,
+            'min_entry_seconds_left': 60,
+            'entry_timeout_min': 60,
+            'poll_sec': 5.0,
+        },
+        'aggressive': {
+            'threshold': 0.70,
+            'stake_usd': 5.0,
+            'stop_loss_pct': 0.30,
+            'exit_before_sec': 20,
+            'min_entry_seconds_left': 60,
+            'entry_timeout_min': 60,
+            'poll_sec': 5.0,
+        },
+    }
+    
+    if not config_path.exists():
+        return fallback_profiles
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        profiles = {}
+        for profile_name, profile_data in config.get('profiles', {}).items():
+            signal = profile_data.get('signal', {})
+            sizing = profile_data.get('sizing', {})
+            stop_loss = profile_data.get('stop_loss', {})
+            session_timing = config.get('shared_rules', {}).get('session_timing', {})
+            
+            profiles[profile_name] = {
+                'threshold': signal.get('threshold_price', 0.70),
+                'stake_usd': sizing.get('stake_usd', 5.0),
+                'stop_loss_pct': stop_loss.get('stop_loss_pct_from_entry', 0.25),
+                'exit_before_sec': session_timing.get('exit_before_sec', 20),
+                'min_entry_seconds_left': session_timing.get('min_entry_seconds_left', 60),
+                'entry_timeout_min': 60,
+                'poll_sec': 5.0,
+            }
+        
+        return profiles if profiles else fallback_profiles
+    except Exception:
+        return fallback_profiles
+
+
+PROFILES = load_profiles_from_yaml()
 
 
 def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
@@ -421,6 +459,20 @@ def main():
                 'min_spread': min_spread,
             })
 
+            # Enforce spread gate: skip if spread is too wide
+            max_spread = 0.03
+            if min_spread is not None and min_spread > max_spread:
+                report['attempts'].append({
+                    'ts': ts_utc(),
+                    'slug': slug,
+                    'status': 'skip_spread_too_wide',
+                    'min_spread': min_spread,
+                    'max_spread': max_spread,
+                    'seconds_left': sec_left,
+                })
+                time.sleep(args.poll_sec)
+                continue
+
             candidates: list[tuple[str, float]] = []
             if up_ask is not None and float(up_ask) >= args.threshold:
                 candidates.append(('UP', float(up_ask)))
@@ -499,7 +551,12 @@ def main():
             close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
             break
 
-        side_px = get_side_price_from_slug(opened['market_slug'], opened['side'])
+        # Use CLOB bid (sellable price) for stop-loss, not Gamma mid
+        try:
+            side_px = clob_best_bid(opened['token_id'])
+        except Exception:
+            side_px = get_side_price_from_slug(opened['market_slug'], opened['side'])
+        
         report['last_side_price'] = side_px
         report['last_check_at'] = ts_utc()
         if side_px is not None and side_px <= sl_price:
@@ -660,11 +717,45 @@ def main():
     report['closed'] = closed
 
     pnl = None
+    pnl_note = None
     if closed['close_usdc']:
+        # Gross PnL (without fees)
         pnl = round(closed['close_usdc'] - opened['cost_usdc'], 6)
+        pnl_note = "IMPORTANT: PnL excludes Polymarket taker fees (~2% on crypto markets at 70c entry). Actual net PnL is lower."
+        
+        # Estimate fees for informational purposes (Polymarket crypto: fee = shares * 0.07 * p * (1-p))
+        entry_price = opened['entry_price']
+        shares = opened['shares']
+        entry_fee_estimate = round(shares * 0.07 * entry_price * (1 - entry_price), 6)
+        
+        if closed['close_usdc'] > 0:
+            close_price = closed['close_usdc'] / shares if shares > 0 else 0
+            close_fee_estimate = round(shares * 0.07 * close_price * (1 - close_price), 6)
+        else:
+            close_fee_estimate = 0
+        
+        total_fee_estimate = entry_fee_estimate + close_fee_estimate
+        net_pnl_estimate = round(pnl - total_fee_estimate, 6)
+        
+        report['fee_estimates'] = {
+            'entry_fee_usdc': entry_fee_estimate,
+            'close_fee_usdc': close_fee_estimate,
+            'total_fee_usdc': total_fee_estimate,
+            'note': 'Estimated using Polymarket crypto fee formula: shares * 0.07 * p * (1-p)',
+        }
+        report['net_pnl_estimate_usdc'] = net_pnl_estimate
+    
     report['realized_cashflow_pnl_usdc'] = pnl
+    report['pnl_note'] = pnl_note
     report['finished_at'] = ts_utc()
-    report['result'] = 'done'
+    
+    # Report result accurately: done only if close succeeded, otherwise incomplete/failed
+    if closed['close_success']:
+        report['result'] = 'done'
+    elif closed['close_skipped']:
+        report['result'] = 'incomplete_close_skipped'
+    else:
+        report['result'] = 'incomplete_close_failed'
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
