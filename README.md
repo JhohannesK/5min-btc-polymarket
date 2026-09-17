@@ -14,9 +14,10 @@ Polymarket BTC 5m Up/Down markets resolve as:
 
 ### Entry Logic
 1. Pin the Chainlink 60s TWAP at window open
-2. Track live TWAP path during the 5-minute window
-3. Calculate fair P(Up) = P(TWAP_end ≥ TWAP_open) from current TWAP + residual vol
-4. **Trade the cheap side vs fair** when net edge > minimum threshold:
+2. Track the live 60s TWAP path during the 5-minute window
+3. Calculate fair P(Up) from the **projected final 60s TWAP** (incomplete path + remaining settle window). Spot momentum is ignored.
+4. Default entry window T-240 to T-45 when |fair-0.5| and net edge are clear. Soft-skip the first ~20s of the bucket. Hard-skip the last ~15-20s unless a polarized ask is still <= hold-EV minus buffer and depth is OK.
+5. **Trade the cheap side vs fair** when net edge > minimum threshold:
    - Net edge = (fair value - book price) - costs
    - Costs = crypto taker fee (7% × p × (1-p)) + half-spread
    - Default min edge: 5 bps (conservative) or 3 bps (aggressive)

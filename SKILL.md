@@ -10,6 +10,7 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Ch
 - Core runner: `src/live/pm_live_trade_runner.py`
 - Canonical skill runner: `scripts/test_btc_5m_session_exit_sl.py`
 - TWAP fair value module: `scripts/btc_5m_twap_fair.py`
+- Entry timing (W4): `scripts/btc_5m_entry_timing.py`
 - W1/W2/W5 win-more gates: `scripts/btc_5m_winmore_gates.py`
 - State tracker: `scripts/btc_5m_state_tracker.py`
 - Skill control entrypoint: `scripts/btc5m_ctl.sh`
@@ -18,12 +19,13 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Ch
 ## Strategy Alignment
 Use this skill when the operator wants to execute a BTC 5m TWAP fair-value strategy:
 - **Settlement-aligned**: Uses Chainlink BTC/USD 60s TWAP (the series Polymarket pays).
-- **Entry**: Pins window-open TWAP. Calculates fair P(TWAP_end ≥ TWAP_open) from live path + residual vol. Trades the cheap side when net edge > costs.
+- **Entry**: Pins window-open TWAP. W3 projected-final-TWAP: P(Up) from the incomplete 60s path + remaining settle window (not spot momentum). Default W4 window T-240 to T-45. Trades the cheap side when net edge > costs.
 - **Exit**: Holds to redeem unless bid ≥ hold-EV after fees. No legacy % stops.
 - **Risk**: One ticket per bucket, hard daily loss limit, kill switch.
 
 ## Operational Rules
-- Default is dry-run unless `--execute` is set. Do not enable `--execute` until W1/W2/W5 paper numbers are re-validated.
+- Default is dry-run unless `--execute` is set. Do not enable `--execute` until W1-W5 paper numbers are re-validated.
+- W3 projected-final-TWAP fair; W4 entry window T-240 to T-45 (soft-skip open, hard-skip last ~20s unless polarized hold-EV exception).
 - TWAP entries go through win-more gates: mid-band taker ban / fee_pp, 250ms delay buffer + GTD/post-only, depth+Kelly sizing, no second clip on decay.
 - Use controlled stake sizing (`--stake-usd`, profile caps, then W5 depth/Kelly cap).
 - If both UP and DOWN satisfy threshold logic, choose the stronger side.

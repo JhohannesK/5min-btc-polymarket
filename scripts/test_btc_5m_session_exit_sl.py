@@ -20,9 +20,15 @@ from btc_5m_twap_fair import (
     FairValueCalculator,
     calculate_hold_ev
 )
+from btc_5m_entry_timing import (
+    TimingDecision,
+    entry_timing_from_mapping,
+    evaluate_entry_timing,
+)
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
 from btc_5m_winmore_gates import (
+    EntryDecision,
     WinmoreConfig,
     decision_log_fields,
     evaluate_side,
@@ -155,6 +161,24 @@ def _best_bid_ask(book) -> tuple[Optional[float], Optional[float]]:
         if best_ask is None or p < best_ask:
             best_ask = p
     return best_bid, best_ask
+
+
+def _best_ask_notional(book) -> float:
+    """Top-of-book ask notional in USD (price * size). 0 if the book is empty."""
+    asks = getattr(book, 'asks', []) or []
+    best_p = None
+    best_sz = 0.0
+    for a in asks:
+        p = float(getattr(a, 'price', 0) or 0)
+        if p <= 0:
+            continue
+        sz = float(getattr(a, 'size', 0) or 0)
+        if best_p is None or p < best_p:
+            best_p = p
+            best_sz = sz
+    if best_p is None:
+        return 0.0
+    return best_p * best_sz
 
 
 def fetch_clob_books(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com'):
@@ -329,6 +353,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 5.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'entry_timing': {},
             'daily_max_loss_usd': 50.0,
             'max_trades_per_day': 12,
             'winmore': winmore_config_from_mapping(None),
@@ -345,6 +370,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 3.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'entry_timing': {},
             'daily_max_loss_usd': 50.0,
             'max_trades_per_day': 20,
             'winmore': winmore_config_from_mapping({
@@ -370,6 +396,8 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             stop_loss = profile_data.get('stop_loss', {})
             session_timing = config.get('shared_rules', {}).get('session_timing', {})
             twap_fair = profile_data.get('twap_fair_value', {})
+            entry_timing = dict(session_timing.get('entry_timing') or {})
+            entry_timing.update(twap_fair.get('entry_timing') or {})
             
             profiles[profile_name] = {
                 'threshold': signal.get('threshold_price', 0.70),
@@ -383,6 +411,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
                 'min_edge_bps': twap_fair.get('min_edge_bps', 5.0),
                 'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
                 'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
+                'entry_timing': entry_timing,
                 'daily_max_loss_usd': float(sizing.get('daily_max_loss_usd', 50.0)),
                 'max_trades_per_day': int(sizing.get('max_trades_per_day', 20)),
                 'winmore': winmore_config_from_mapping(profile_data.get('winmore')),
@@ -420,6 +449,7 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
     if args.hold_to_redeem is None:
         args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
+    args.entry_timing_cfg = entry_timing_from_mapping(prof.get('entry_timing'))
     args.daily_max_loss_usd = float(prof.get('daily_max_loss_usd', 50.0))
     args.max_trades_per_day = int(prof.get('max_trades_per_day', 20))
     wm = prof.get('winmore')
@@ -517,6 +547,12 @@ def main():
             'btc_daily_vol_pct': args.btc_daily_vol_pct if use_fair_value else None,
             'hold_to_redeem': args.hold_to_redeem,
             'legacy_threshold_mode': args.legacy_threshold_mode,
+            'entry_timing': {
+                'window_max_seconds_left': args.entry_timing_cfg.window_max_seconds_left,
+                'window_min_seconds_left': args.entry_timing_cfg.window_min_seconds_left,
+                'soft_skip_open_sec': args.entry_timing_cfg.soft_skip_open_sec,
+                'hard_skip_last_sec': args.entry_timing_cfg.hard_skip_last_sec,
+            },
             'winmore': {
                 'min_edge_pp': winmore_cfg.min_edge_pp,
                 'midband_taker_policy': winmore_cfg.midband_taker_policy,
@@ -590,8 +626,8 @@ def main():
                 time.sleep(args.poll_sec)
                 continue
 
-            # Do not open if less than N seconds remain in current slot.
-            if sec_left < args.min_entry_seconds_left:
+            # Legacy blunt late-entry skip. Fair-value path uses W4 timing instead.
+            if (not use_fair_value) and sec_left < args.min_entry_seconds_left:
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
@@ -687,6 +723,8 @@ def main():
                 prior_edge = fill_attempts.get(current_bucket)
                 up_levels = parse_book_levels(getattr(up_book, 'asks', None))
                 dn_levels = parse_book_levels(getattr(dn_book, 'asks', None))
+                up_ask_notional = _best_ask_notional(up_book)
+                dn_ask_notional = _best_ask_notional(dn_book)
 
                 up_decision = evaluate_side(
                     'UP',
@@ -722,7 +760,15 @@ def main():
                     'fair_p_down': fair_value.p_down,
                     'window_open_twap': fair_value.window_open_twap,
                     'current_twap': fair_value.current_twap,
+                    'projected_final_twap': fair_value.projected_final_twap,
+                    'locked_frac': fair_value.locked_frac,
+                    'remaining_frac': fair_value.remaining_frac,
+                    'fair_model': fair_value.model,
                     'edge_signal': fair_value.edge_signal,
+                    'source': fair_value.source,
+                    'source_ts': fair_value.source_ts,
+                    'receipt_ts': fair_value.receipt_ts,
+                    'decision_ts': fair_value.decision_ts,
                     'up_ask': up_ask,
                     'dn_ask': dn_ask,
                     'up_gate': decision_log_fields(up_decision),
@@ -746,18 +792,72 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
+                timed: list[tuple[EntryDecision, TimingDecision]] = []
+                for cand in (up_decision, dn_decision):
+                    if not cand.allow or not cand.side:
+                        continue
+                    fair_p_side = fair_value.p_up if cand.side == 'UP' else fair_value.p_down
+                    notional = up_ask_notional if cand.side == 'UP' else dn_ask_notional
+                    timing = evaluate_entry_timing(
+                        seconds_left=sec_left,
+                        fair_p=fair_p_side,
+                        ask=cand.entry_price,
+                        net_edge_bps=cand.net_edge_pp * 10000.0,
+                        min_edge_bps=cand.required_min_edge_pp * 10000.0,
+                        top_ask_notional_usd=notional,
+                        cfg=args.entry_timing_cfg,
+                    )
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'entry_timing_check',
+                        'side': cand.side,
+                        'allow': timing.allow,
+                        'reason': timing.reason,
+                        'zone': timing.zone,
+                        'seconds_left': sec_left,
+                        'abs_fair_dev': timing.abs_fair_dev,
+                        'top_ask_notional_usd': notional,
+                    })
+                    if timing.allow:
+                        timed.append((cand, timing))
+
+                if not timed:
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_entry_timing',
+                        'seconds_left': sec_left,
+                    })
+                    time.sleep(args.poll_sec)
+                    continue
+
+                decision, timing = sorted(timed, key=lambda x: x[0].net_edge_pp, reverse=True)[0]
                 side = str(decision.side)
                 trigger_price = decision.entry_price
                 entry_stake = decision.size_usd
                 entry_order_type = decision.order_type
                 twap_entry_net_edge = decision.net_edge_pp
                 report['entry_edge_details'] = decision_log_fields(decision)
+                report['entry_timing'] = {
+                    'reason': timing.reason,
+                    'zone': timing.zone,
+                    'seconds_left': sec_left,
+                }
                 report['entry_fair_value'] = {
                     'p_up': fair_value.p_up,
                     'p_down': fair_value.p_down,
                     'window_open_twap': fair_value.window_open_twap,
                     'current_twap': fair_value.current_twap,
+                    'projected_final_twap': fair_value.projected_final_twap,
+                    'locked_frac': fair_value.locked_frac,
+                    'remaining_frac': fair_value.remaining_frac,
+                    'model': fair_value.model,
                     'edge_signal': fair_value.edge_signal,
+                    'source': fair_value.source,
+                    'source_ts': fair_value.source_ts,
+                    'receipt_ts': fair_value.receipt_ts,
+                    'decision_ts': fair_value.decision_ts,
                 }
             else:
                 # Legacy threshold-only mode

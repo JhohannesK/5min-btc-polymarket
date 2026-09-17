@@ -8,16 +8,25 @@ Polymarket BTC 5m Up/Down markets settle on:
 This module:
 1. Tracks Chainlink BTC/USD 60s TWAP (the same series Polymarket uses for settlement)
 2. Pins window-open TWAP when a 5m market becomes active
-3. Estimates fair P(TWAP_end >= TWAP_open) from live TWAP path + residual vol
+3. Estimates fair P(TWAP_end >= TWAP_open) from the incomplete 60s TWAP path
+   plus residual vol on the remaining settle window (W3 projected-final-TWAP).
+
+Fair is TWAP-path based. Spot price is never an input to P(Up); passing it is ignored.
 """
 
 import os
 import time
 import math
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import dataclass
 
 import requests
+
+
+TWAP_WINDOW_SEC = 60.0
+BUCKET_SEC = 300.0
+SECONDS_PER_DAY = 86400.0
+FAIR_MODEL = "projected_final_twap"
 
 
 @dataclass
@@ -28,6 +37,8 @@ class TWAPSnapshot:
     window_seconds: int
     source: str = "chainlink"
     series_id: str = "btc-usd-twap-60s"
+    source_ts: Optional[float] = None
+    receipt_ts: Optional[float] = None
 
 
 @dataclass
@@ -40,6 +51,180 @@ class FairValue:
     seconds_left: float
     edge_signal: str
     confidence: float
+    projected_final_twap: float = 0.0
+    locked_frac: float = 0.0
+    remaining_frac: float = 1.0
+    residual_vol: float = 0.0
+    model: str = FAIR_MODEL
+    source: str = ""
+    source_ts: Optional[float] = None
+    receipt_ts: Optional[float] = None
+    decision_ts: Optional[float] = None
+    spot_ignored: bool = False
+
+
+def parse_source_ts(data: dict[str, Any]) -> Optional[float]:
+    """Extract feed-produced timestamp from an RTDS/API payload. Never invent one."""
+    for key in ("sourceTs", "source_ts", "timestamp", "ts", "time"):
+        raw = data.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def settle_window_weights(
+    seconds_left: float,
+    twap_window_sec: float = TWAP_WINDOW_SEC,
+) -> tuple[float, float]:
+    """
+    Fraction of the settlement 60s TWAP already locked vs still unknown.
+
+    If seconds_left >= 60, the settle window has not started: locked=0, remaining=1.
+    If seconds_left = 20, 40s of the 60s window is locked: locked=2/3, remaining=1/3.
+    """
+    if twap_window_sec <= 0:
+        return 0.0, 1.0
+    unknown = min(max(seconds_left, 0.0), twap_window_sec)
+    remaining_frac = unknown / twap_window_sec
+    locked_frac = 1.0 - remaining_frac
+    return locked_frac, remaining_frac
+
+
+def project_final_twap(
+    current_twap: float,
+    locked_frac: float,
+    remaining_frac: float,
+    locked_level: Optional[float] = None,
+) -> float:
+    """
+    Projected settlement 60s TWAP from the incomplete path.
+
+    locked_level is the TWAP-path estimate of the already-elapsed settle window.
+    Remaining prices are martingale at current_twap (not spot).
+    """
+    locked = current_twap if locked_level is None else locked_level
+    return locked_frac * locked + remaining_frac * current_twap
+
+
+def residual_twap_vol(
+    seconds_left: float,
+    btc_daily_vol_pct: float,
+    twap_window_sec: float = TWAP_WINDOW_SEC,
+) -> float:
+    """
+    Residual log-vol of the final 60s TWAP vs the current projected mean.
+
+    Only the unlocked portion of the settle window can still move the average.
+    Time until the settle window starts adds price-level uncertainty.
+    This is smaller than spot residual vol late in the bucket (kills spot-momentum
+    false edges that treat the TWAP as if it could still fully reprice like spot).
+    """
+    daily_vol = max(0.0, btc_daily_vol_pct) / 100.0
+    _, remaining_frac = settle_window_weights(seconds_left, twap_window_sec)
+    tau_to_window = max(0.0, seconds_left - twap_window_sec)
+    unknown_sec = remaining_frac * twap_window_sec
+
+    sigma_level = daily_vol * math.sqrt(tau_to_window / SECONDS_PER_DAY) if tau_to_window > 0 else 0.0
+    if unknown_sec <= 0 or remaining_frac <= 0:
+        return sigma_level
+
+    sigma_spot_remaining = daily_vol * math.sqrt(unknown_sec / SECONDS_PER_DAY)
+    # Brownian average over the unknown settle-window slice: vol / sqrt(3)
+    sigma_unlocked = remaining_frac * (sigma_spot_remaining / math.sqrt(3.0))
+    return math.sqrt(sigma_level * sigma_level + sigma_unlocked * sigma_unlocked)
+
+
+def p_up_from_projected(
+    window_open_twap: float,
+    projected_final_twap: float,
+    residual_vol: float,
+) -> float:
+    """P(final 60s TWAP >= window-open TWAP) from the projected mean + residual vol."""
+    if window_open_twap <= 0 or projected_final_twap <= 0:
+        return 0.5
+    log_gap = math.log(projected_final_twap / window_open_twap)
+    if residual_vol <= 0:
+        return 1.0 if log_gap >= 0 else 0.0
+    z_score = log_gap / residual_vol
+    return (1.0 + math.erf(z_score / math.sqrt(2.0))) / 2.0
+
+
+def locked_level_from_path(
+    path: list[TWAPSnapshot],
+    now: float,
+    seconds_left: float,
+    twap_window_sec: float = TWAP_WINDOW_SEC,
+) -> Optional[float]:
+    """Average TWAP-path samples that fall in the already-elapsed settle window."""
+    locked_frac, _ = settle_window_weights(seconds_left, twap_window_sec)
+    if locked_frac <= 0 or not path:
+        return None
+    settle_start = now + seconds_left - twap_window_sec
+    samples = []
+    for snap in path:
+        ts = snap.receipt_ts if snap.receipt_ts is not None else snap.timestamp
+        if ts >= settle_start:
+            samples.append(snap.twap_60s)
+    if not samples:
+        return None
+    return sum(samples) / len(samples)
+
+
+def projected_final_twap_fair(
+    window_open_twap: float,
+    current_twap: float,
+    seconds_left: float,
+    btc_daily_vol_pct: float = 3.5,
+    locked_level: Optional[float] = None,
+    twap_window_sec: float = TWAP_WINDOW_SEC,
+    spot_price: Optional[float] = None,
+    source: str = "",
+    source_ts: Optional[float] = None,
+    receipt_ts: Optional[float] = None,
+    decision_ts: Optional[float] = None,
+) -> dict[str, Any]:
+    """
+    W3: P(Up) from incomplete 60s TWAP path + remaining settle window.
+
+    spot_price is accepted and ignored. Settlement is the 60s TWAP path, not spot
+    momentum. Same projected endpoint early vs late: same side of 0.5, later more
+    confident (less residual vol on the unlocked fraction).
+    """
+    _ = spot_price  # explicitly unused; fair is TWAP-path based
+    locked_frac, remaining_frac = settle_window_weights(seconds_left, twap_window_sec)
+    projected = project_final_twap(current_twap, locked_frac, remaining_frac, locked_level)
+    residual_vol = residual_twap_vol(seconds_left, btc_daily_vol_pct, twap_window_sec)
+    p_up = p_up_from_projected(window_open_twap, projected, residual_vol)
+    p_down = 1.0 - p_up
+
+    move_bps = (projected / window_open_twap - 1.0) * 10000.0 if window_open_twap > 0 else 0.0
+    if abs(move_bps) < 5:
+        edge_signal = "neutral"
+    elif move_bps > 5:
+        edge_signal = "up_favored"
+    else:
+        edge_signal = "down_favored"
+
+    return {
+        "p_up": p_up,
+        "p_down": p_down,
+        "projected_final_twap": projected,
+        "locked_frac": locked_frac,
+        "remaining_frac": remaining_frac,
+        "residual_vol": residual_vol,
+        "edge_signal": edge_signal,
+        "confidence": min(abs(p_up - 0.5) * 2.0, 1.0),
+        "model": FAIR_MODEL,
+        "source": source,
+        "source_ts": source_ts,
+        "receipt_ts": receipt_ts,
+        "decision_ts": decision_ts,
+        "spot_ignored": spot_price is not None,
+    }
 
 
 class ChainlinkTWAPTracker:
@@ -103,12 +288,16 @@ class ChainlinkTWAPTracker:
                 if window_seconds != 60:
                     raise ValueError(f"RTDS returned wrong window: {window_seconds}s, expected 60s")
                 
+                receipt_ts = now
+                source_ts = parse_source_ts(data)
                 snapshot = TWAPSnapshot(
-                    timestamp=now,
+                    timestamp=receipt_ts,
                     twap_60s=float(data['value']),
                     window_seconds=window_seconds,
                     source="chainlink_rtds",
-                    series_id=data.get('series', 'btc-usd-twap-60s')
+                    series_id=data.get('series', 'btc-usd-twap-60s'),
+                    source_ts=source_ts if source_ts is not None else receipt_ts,
+                    receipt_ts=receipt_ts,
                 )
                 self._cache[cache_key] = snapshot
                 print(f"[RTDS] Connected successfully: windowSeconds={window_seconds}")
@@ -130,12 +319,15 @@ class ChainlinkTWAPTracker:
         print("[TWAP_FALLBACK] Using spot estimate - ONLY FOR DRY-RUN")
         twap_value = self._estimate_twap_from_spot()
         if twap_value is not None:
+            receipt_ts = now
             snapshot = TWAPSnapshot(
-                timestamp=now,
+                timestamp=receipt_ts,
                 twap_60s=twap_value,
                 window_seconds=60,  # Assumed for dry-run
                 source="spot_fallback_dry_run_only",
-                series_id="spot-estimate-not-rtds"
+                series_id="spot-estimate-not-rtds",
+                source_ts=receipt_ts,
+                receipt_ts=receipt_ts,
             )
             self._cache[cache_key] = snapshot
             return snapshot
@@ -182,17 +374,26 @@ class ChainlinkTWAPTracker:
 class FairValueCalculator:
     """
     Calculates fair P(Up) and P(Down) for a 5m BTC Up/Down market.
-    
-    Fair value = P(TWAP_end >= TWAP_open) based on:
-    - Window-open TWAP (pinned)
-    - Current live TWAP
-    - Residual time to settlement
-    - Estimated BTC vol
+
+    W3 projected-final-TWAP:
+    - Incomplete 60s TWAP path (locked fraction of the settle window)
+    - Residual vol only on the remaining settle window
+    - Never uses spot momentum
     """
-    
+
     def __init__(self, twap_tracker: ChainlinkTWAPTracker):
         self.twap_tracker = twap_tracker
         self._window_pins: dict[str, TWAPSnapshot] = {}
+        self._paths: dict[str, list[TWAPSnapshot]] = {}
+
+    def record_path_sample(self, market_slug: str, snapshot: TWAPSnapshot) -> None:
+        """Keep recent 60s TWAP-path samples for the incomplete settle window."""
+        path = self._paths.setdefault(market_slug, [])
+        path.append(snapshot)
+        cutoff = (snapshot.receipt_ts or snapshot.timestamp) - TWAP_WINDOW_SEC
+        self._paths[market_slug] = [
+            s for s in path if (s.receipt_ts or s.timestamp) >= cutoff
+        ]
     
     def pin_window_open(self, market_slug: str, allow_fallback: bool = True) -> Optional[TWAPSnapshot]:
         """
@@ -212,11 +413,18 @@ class FairValueCalculator:
         current = self.twap_tracker.get_current_twap(allow_fallback=allow_fallback)
         if current:
             # SHIP-BLOCKER: Log windowSeconds to prevent silent 30s/60s mix
+            receipt_ts = current.receipt_ts if current.receipt_ts is not None else current.timestamp
+            source_ts = current.source_ts if current.source_ts is not None else receipt_ts
+            decision_ts = time.time()
             print(f"[TWAP_PIN] market={market_slug} "
                   f"windowSeconds={current.window_seconds} "
                   f"series={current.series_id} "
                   f"value={current.twap_60s:.2f} "
-                  f"source={current.source}")
+                  f"source={current.source} "
+                  f"source_ts={source_ts:.6f} "
+                  f"receipt_ts={receipt_ts:.6f} "
+                  f"decision_ts={decision_ts:.6f}")
+            self.record_path_sample(market_slug, current)
             
             # Validate 60s series (enforce since Aug 14, 2026)
             if current.window_seconds != 60:
@@ -237,21 +445,23 @@ class FairValueCalculator:
         market_slug: str,
         seconds_left: float,
         btc_daily_vol_pct: float = 3.5,
-        allow_fallback: bool = True
+        allow_fallback: bool = True,
+        spot_price: Optional[float] = None,
     ) -> Optional[FairValue]:
         """
-        Calculate fair P(Up) for a 5m market.
-        
-        CRITICAL: Logs windowSeconds on every calculation (ship-blocker requirement).
-        
+        Calculate fair P(Up) for a 5m market via projected-final-TWAP (W3).
+
+        CRITICAL: Logs windowSeconds plus source/receipt/decision timestamps.
+
         Args:
             market_slug: Market identifier (e.g. btc-updown-5m-1234567890)
             seconds_left: Seconds remaining until settlement
             btc_daily_vol_pct: Estimated BTC daily volatility % (default 3.5%)
-            allow_fallback: If False, raises if RTDS not configured (for --execute mode)
+            allow_fallback: If False, raises if RTDS not configured (live path)
+            spot_price: Ignored. Fair is TWAP-path based, not spot momentum.
         
         Returns:
-            FairValue with P(Up), P(Down), and edge signal
+            FairValue with P(Up), P(Down), projected final TWAP, and timestamps
         """
         # Get pinned window-open TWAP
         open_twap_snapshot = self._window_pins.get(market_slug)
@@ -267,64 +477,71 @@ class FairValueCalculator:
             return None
         current_twap = current_snapshot.twap_60s
         
-        # SHIP-BLOCKER: Log windowSeconds on every calculation
-        print(f"[TWAP_CALC] market={market_slug} "
-              f"windowSeconds={current_snapshot.window_seconds} "
-              f"series={current_snapshot.series_id} "
-              f"open={open_twap:.2f} current={current_twap:.2f}")
-        
         # Validate 60s series match
         if current_snapshot.window_seconds != 60 or open_twap_snapshot.window_seconds != 60:
             print(f"[TWAP_CALC_ERROR] WINDOW MISMATCH: "
                   f"current={current_snapshot.window_seconds}s, "
                   f"open={open_twap_snapshot.window_seconds}s")
             return None
-        
-        # Calculate implied move and residual vol
-        price_ratio = current_twap / open_twap
-        log_move = math.log(price_ratio)
-        
-        # Residual vol scaled to remaining time
-        # Daily vol -> 5min vol: sqrt(5min / 1440min) * daily_vol
-        five_min_vol = btc_daily_vol_pct / 100.0 * math.sqrt(5.0 / (24.0 * 60.0))
-        
-        # Further scale by actual seconds left (may be less than full 5min)
-        time_fraction = min(1.0, seconds_left / 300.0)
-        residual_vol = five_min_vol * math.sqrt(time_fraction)
-        
-        # Estimate P(TWAP_end >= TWAP_open)
-        # Simple model: current TWAP is a noisy signal of where end TWAP will be
-        # P(Up) = P(log_return_end >= 0) 
-        #       ≈ Φ((log_current_vs_open + 0) / residual_vol)
-        # where Φ is standard normal CDF
-        
-        if residual_vol > 0:
-            z_score = log_move / residual_vol
-            p_up = self._normal_cdf(z_score)
-        else:
-            p_up = 1.0 if log_move >= 0 else 0.0
-        
-        p_down = 1.0 - p_up
-        
-        # Edge signal: which side is likely cheap vs naive 50/50
-        move_bps = (price_ratio - 1.0) * 10000
-        if abs(move_bps) < 5:
-            edge_signal = "neutral"
-        elif move_bps > 5:
-            edge_signal = "up_favored"
-        else:
-            edge_signal = "down_favored"
-        
-        confidence = min(abs(p_up - 0.5) * 2.0, 1.0)
-        
-        return FairValue(
-            p_up=p_up,
-            p_down=p_down,
+
+        self.record_path_sample(market_slug, current_snapshot)
+        decision_ts = time.time()
+        receipt_ts = current_snapshot.receipt_ts if current_snapshot.receipt_ts is not None else current_snapshot.timestamp
+        source_ts = current_snapshot.source_ts if current_snapshot.source_ts is not None else receipt_ts
+
+        path_locked = locked_level_from_path(
+            self._paths.get(market_slug, []),
+            now=receipt_ts,
+            seconds_left=seconds_left,
+        )
+        model = projected_final_twap_fair(
             window_open_twap=open_twap,
             current_twap=current_twap,
             seconds_left=seconds_left,
-            edge_signal=edge_signal,
-            confidence=confidence
+            btc_daily_vol_pct=btc_daily_vol_pct,
+            locked_level=path_locked,
+            spot_price=spot_price,
+            source=current_snapshot.source,
+            source_ts=source_ts,
+            receipt_ts=receipt_ts,
+            decision_ts=decision_ts,
+        )
+
+        # SHIP-BLOCKER: Log windowSeconds + timestamps on every calculation
+        print(f"[TWAP_CALC] market={market_slug} "
+              f"windowSeconds={current_snapshot.window_seconds} "
+              f"series={current_snapshot.series_id} "
+              f"open={open_twap:.2f} current={current_twap:.2f} "
+              f"model={model['model']} "
+              f"locked_frac={model['locked_frac']:.4f} "
+              f"remaining_frac={model['remaining_frac']:.4f} "
+              f"projected_final={model['projected_final_twap']:.2f} "
+              f"p_up={model['p_up']:.4f} "
+              f"residual_vol={model['residual_vol']:.6f} "
+              f"source={current_snapshot.source} "
+              f"source_ts={source_ts:.6f} "
+              f"receipt_ts={receipt_ts:.6f} "
+              f"decision_ts={decision_ts:.6f} "
+              f"spot_ignored={model['spot_ignored']}")
+
+        return FairValue(
+            p_up=model["p_up"],
+            p_down=model["p_down"],
+            window_open_twap=open_twap,
+            current_twap=current_twap,
+            seconds_left=seconds_left,
+            edge_signal=model["edge_signal"],
+            confidence=model["confidence"],
+            projected_final_twap=model["projected_final_twap"],
+            locked_frac=model["locked_frac"],
+            remaining_frac=model["remaining_frac"],
+            residual_vol=model["residual_vol"],
+            model=model["model"],
+            source=current_snapshot.source,
+            source_ts=source_ts,
+            receipt_ts=receipt_ts,
+            decision_ts=decision_ts,
+            spot_ignored=model["spot_ignored"],
         )
     
     @staticmethod

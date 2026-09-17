@@ -3,8 +3,10 @@
 ## Canonical execution path
 - Strategy runner (canonical):
   - `scripts/test_btc_5m_session_exit_sl.py`
-- TWAP fair-value module:
+- TWAP fair value (W3 projected-final-TWAP):
   - `scripts/btc_5m_twap_fair.py`
+- Entry timing (W4):
+  - `scripts/btc_5m_entry_timing.py`
 - W1/W2/W5 win-more gates (fee-aware / delay buffer / depth-Kelly):
   - `scripts/btc_5m_winmore_gates.py`
 - Unified control entrypoint:
