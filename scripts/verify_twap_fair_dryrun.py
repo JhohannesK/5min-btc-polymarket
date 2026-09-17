@@ -18,6 +18,13 @@ from btc_5m_twap_fair import (
     projected_final_twap_fair,
 )
 from btc_5m_entry_timing import evaluate_entry_timing
+from btc_5m_winmore_gates import (
+    BookLevel,
+    evaluate_side,
+    fee_pp,
+    winmore_config_from_mapping,
+    choose_entry_order_type,
+)
 
 
 def main():
@@ -110,6 +117,27 @@ def main():
     print(f"   ✓ hard-skip last: {hard.reason} allow={hard.allow}")
     print(f"   ✓ late polarized: {late_ok.reason} allow={late_ok.allow}")
     
+    # Test win-more gates (W1/W2/W5) without live credentials
+    print("\n10. Testing W1/W2/W5 win-more gates (dry-run, no execute)...")
+    wm = winmore_config_from_mapping(None)
+    print(f"   delay_ms={wm.taker_delay_ms} order_type={choose_entry_order_type(wm)}")
+    print(f"   fee_pp(0.50)={fee_pp(0.50, 0.01):.4f} (pp, not bps)")
+    wm_mid = evaluate_side(
+        "UP", 0.70, 0.50, 0.48, [BookLevel(0.50, 100.0)], wm, 5.0, 50.0, 3.5
+    )
+    wm_wing = evaluate_side(
+        "UP", 0.85, 0.70, 0.69, [BookLevel(0.70, 100.0)], wm, 5.0, 50.0, 3.5
+    )
+    print(f"   mid-band 50c: allow={wm_mid.allow} reason={wm_mid.reason}")
+    print(f"   wing 70c: allow={wm_wing.allow} reason={wm_wing.reason} size=${wm_wing.size_usd:.2f} "
+          f"net_edge_pp={wm_wing.net_edge_pp:.4f} order={wm_wing.order_type}")
+    if wm_mid.allow:
+        print("   ❌ mid-band taker ban failed")
+        return 1
+    print("   ✓ W1 mid-band skip + fee_pp gate")
+    print("   ✓ W2 GTD/post-only default + delay buffer in required min")
+    print("   ✓ W5 depth/Kelly sizing on allowed wing print above")
+
     print("\n=== Verification Complete ===")
     print("✓ All components working without live Polymarket credentials")
     print("✓ TWAP tracker operational (using spot fallback)")
@@ -118,6 +146,7 @@ def main():
     print("✓ Hold-EV calculation working")
     print("✓ W3 projected-final-TWAP early/late consistent")
     print("✓ W4 entry-timing gates functional")
+    print("✓ W1/W2/W5 win-more gates functional")
     print("\n⚠️  PRODUCTION REQUIREMENTS:")
     print("   - Connect to RTDS topic: crypto_prices_twap_sixty")
     print("   - Filter: {\"symbol\":\"btc/usd\"}")

@@ -7,6 +7,8 @@
   - `scripts/btc_5m_twap_fair.py`
 - Entry timing (W4):
   - `scripts/btc_5m_entry_timing.py`
+- W1/W2/W5 win-more gates (fee-aware / delay buffer / depth-Kelly):
+  - `scripts/btc_5m_winmore_gates.py`
 - Unified control entrypoint:
   - `scripts/btc5m_ctl.sh` (`start|status|stop|report|logs`)
 - Compatibility wrapper (deprecated path, forwards to canonical):

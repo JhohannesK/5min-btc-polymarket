@@ -605,7 +605,11 @@ def estimate_trade_edge(
     
     # Net edge after costs
     net_edge_bps = edge_bps - cost_bps
-    
+
+    # W1: same gate in probability points (0.01 = 1c). bps kept for logs.
+    fee_pp = taker_fee_per_share + (spread / 2.0) + (depth_cost_bps / 10000.0)
+    net_edge_pp = edge - fee_pp
+
     # Trade signal
     if net_edge_bps > 5:
         signal = "buy"
@@ -613,7 +617,7 @@ def estimate_trade_edge(
         signal = "avoid"
     else:
         signal = "marginal"
-    
+
     return {
         "fair_p": fair_p,
         "book_ask": book_ask,
@@ -627,8 +631,10 @@ def estimate_trade_edge(
         "cost_bps": cost_bps,
         "edge_bps": edge_bps,
         "net_edge_bps": net_edge_bps,
+        "fee_pp": fee_pp,
+        "net_edge_pp": net_edge_pp,
         "signal": signal,
-        "note": "C = shares in fee formula: shares × 0.07 × p × (1-p)"
+        "note": "C = shares in fee formula: shares × 0.07 × p × (1-p); gate uses fee_pp not bps-only",
     }
 
 
