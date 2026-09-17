@@ -10,6 +10,7 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Ch
 - Core runner: `src/live/pm_live_trade_runner.py`
 - Canonical skill runner: `scripts/test_btc_5m_session_exit_sl.py`
 - TWAP fair value module: `scripts/btc_5m_twap_fair.py`
+- Maker/post-only shadow pilot (W6): `scripts/btc_5m_maker_pilot.py`
 - State tracker: `scripts/btc_5m_state_tracker.py`
 - Skill control entrypoint: `scripts/btc5m_ctl.sh`
 - Compatibility wrapper (deprecated): `scripts/run_btc_5m_threshold_test.py`
@@ -23,6 +24,7 @@ Use this skill when the operator wants to execute a BTC 5m TWAP fair-value strat
 
 ## Operational Rules
 - Default is dry-run unless `--execute` is set.
+- W6 maker_pilot is shadow-first and off by default (`enabled: false`, `shadow: true`, `live_execute: false`). Live maker posting is stubbed and still requires the execute flag; it does not unlock live trading.
 - Use controlled stake sizing (`--stake-usd`, profile caps).
 - If both UP and DOWN satisfy threshold logic, choose the stronger side.
 - Keep stop-loss and timing guards enabled in profile config.
