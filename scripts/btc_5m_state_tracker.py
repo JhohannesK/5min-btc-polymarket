@@ -131,7 +131,12 @@ class StateTracker:
         
         with open(state_file, 'w') as f:
             json.dump(data, f, indent=2)
-    
+
+    def remaining_loss_budget_usd(self) -> float:
+        """USD left before the daily loss limit. Used by W5 Kelly cap."""
+        state = self.load_state()
+        return max(0.0, self.daily_loss_limit_usd + float(state.realized_pnl_usdc))
+
     def can_open_ticket(self, bucket: int) -> tuple[bool, str]:
         """
         Check if we can open a ticket for this bucket.
@@ -185,6 +190,7 @@ class StateTracker:
             'max_trades_per_day': self.max_trades_per_day,
             'realized_pnl_usdc': state.realized_pnl_usdc,
             'daily_loss_limit_usd': self.daily_loss_limit_usd,
+            'remaining_loss_budget_usd': self.remaining_loss_budget_usd(),
             'active_tickets_count': len(state.active_tickets),
             'active_buckets': sorted(state.active_tickets.keys()),
             'can_trade': state.trades_count < self.max_trades_per_day and state.realized_pnl_usdc >= -self.daily_loss_limit_usd

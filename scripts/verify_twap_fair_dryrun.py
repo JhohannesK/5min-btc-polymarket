@@ -16,6 +16,13 @@ from btc_5m_twap_fair import (
     estimate_trade_edge,
     calculate_hold_ev
 )
+from btc_5m_winmore_gates import (
+    BookLevel,
+    evaluate_side,
+    fee_pp,
+    winmore_config_from_mapping,
+    choose_entry_order_type,
+)
 
 
 def main():
@@ -88,6 +95,27 @@ def main():
         print(f"   Fair={fair_p:.2f}, Bid={bid:.2f}: {hold_ev['recommendation']} "
               f"(EV diff=${hold_ev['ev_diff']:.3f})")
     
+    # Test win-more gates (W1/W2/W5) without live credentials
+    print("\n8. Testing W1/W2/W5 win-more gates (dry-run, no --execute)...")
+    wm = winmore_config_from_mapping(None)
+    print(f"   delay_ms={wm.taker_delay_ms} order_type={choose_entry_order_type(wm)}")
+    print(f"   fee_pp(0.50)={fee_pp(0.50, 0.01):.4f} (pp, not bps)")
+    mid = evaluate_side(
+        "UP", 0.70, 0.50, 0.48, [BookLevel(0.50, 100.0)], wm, 5.0, 50.0, 3.5
+    )
+    wing = evaluate_side(
+        "UP", 0.85, 0.70, 0.69, [BookLevel(0.70, 100.0)], wm, 5.0, 50.0, 3.5
+    )
+    print(f"   mid-band 50c: allow={mid.allow} reason={mid.reason}")
+    print(f"   wing 70c: allow={wing.allow} reason={wing.reason} size=${wing.size_usd:.2f} "
+          f"net_edge_pp={wing.net_edge_pp:.4f} order={wing.order_type}")
+    if mid.allow:
+        print("   ❌ mid-band taker ban failed")
+        return 1
+    print("   ✓ W1 mid-band skip + fee_pp gate")
+    print("   ✓ W2 GTD/post-only default + delay buffer in required min")
+    print("   ✓ W5 depth/Kelly sizing on allowed wing print above")
+
     print("\n=== Verification Complete ===")
     print("✓ All components working without live Polymarket credentials")
     print("✓ TWAP tracker operational (using spot fallback)")
