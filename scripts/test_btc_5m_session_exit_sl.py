@@ -444,8 +444,13 @@ def main():
 
     # Initialize TWAP tracker and fair value calculator
     use_fair_value = args.use_twap_fair_value and not args.legacy_threshold_mode
-    twap_tracker = ChainlinkTWAPTracker(fallback_to_spot=True) if use_fair_value else None
-    fair_calc = FairValueCalculator(twap_tracker) if use_fair_value else None
+    if use_fair_value:
+        # Allow fallback for dry-run; RTDS required for --execute
+        twap_tracker = ChainlinkTWAPTracker()
+        fair_calc = FairValueCalculator(twap_tracker)
+    else:
+        twap_tracker = None
+        fair_calc = None
     
     # Initialize state tracker for one-ticket-per-bucket and daily limits
     state_tracker = StateTracker(
@@ -581,7 +586,20 @@ def main():
 
             # Entry logic: TWAP fair value or legacy threshold
             if use_fair_value and fair_calc is not None:
+                # Check RTDS requirement for --execute mode
+                if args.execute and twap_tracker:
+                    try:
+                        # Force RTDS for live trading
+                        test_snapshot = twap_tracker.get_current_twap(allow_fallback=False)
+                    except RuntimeError as e:
+                        report['rtds_check_failed'] = str(e)
+                        report['result'] = 'rtds_required_for_execute'
+                        report['finished_at'] = ts_utc()
+                        print(json.dumps(report, ensure_ascii=False, indent=2))
+                        return
+                
                 # Calculate fair value based on TWAP
+                allow_fallback = not args.execute
                 fair_value = fair_calc.calculate_fair_value(slug, sec_left, args.btc_daily_vol_pct)
                 
                 if fair_value is None:

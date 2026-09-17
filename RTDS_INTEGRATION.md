@@ -46,33 +46,56 @@ crypto_prices_twap_sixty
 
 ### Constructor
 ```python
+# Set via environment variables (preferred)
+os.environ['CHAINLINK_RTDS_ENDPOINT'] = 'https://data.chain.link/streams/btc-usd-twap-60s-streams'
+os.environ['CHAINLINK_RTDS_API_KEY'] = 'your-api-key'
+
+tracker = ChainlinkTWAPTracker()
+
+# Or pass directly
 tracker = ChainlinkTWAPTracker(
-    fallback_to_spot=False,  # Disable fallback in production
-    rtds_endpoint="https://data.chain.link/streams/btc-usd-twap-60s-streams"
+    rtds_endpoint="https://data.chain.link/streams/btc-usd-twap-60s-streams",
+    rtds_api_key="your-api-key"
 )
 ```
 
 ### get_current_twap()
 
-Production implementation:
+Production implementation (now in code):
 ```python
-response = requests.post(self.rtds_endpoint, json={
-    "topic": "crypto_prices_twap_sixty",
-    "filter": {"symbol": "btc/usd"}
-}, headers={
-    "Authorization": f"Bearer {RTDS_API_KEY}"
-})
+# For --execute mode, requires RTDS
+snapshot = tracker.get_current_twap(allow_fallback=False)
+
+# For dry-run, allows spot fallback
+snapshot = tracker.get_current_twap(allow_fallback=True)
+```
+
+RTDS request flow:
+```python
+response = requests.post(
+    self.rtds_endpoint,
+    json={
+        "topic": "crypto_prices_twap_sixty",
+        "filter": {"symbol": "btc/usd"}
+    },
+    headers={
+        "Authorization": f"Bearer {self.rtds_api_key}",
+        "Content-Type": "application/json"
+    }
+)
 
 data = response.json()
 
-# SHIP-BLOCKER: Validate windowSeconds
-if data.get("windowSeconds") != 60:
-    raise ValueError(f"Wrong TWAP window: got {data['windowSeconds']}s, expected 60s")
+# SHIP-BLOCKER: Validate windowSeconds from feed (never invent it)
+window_seconds = data.get("windowSeconds")
+if window_seconds != 60:
+    raise ValueError(f"Wrong TWAP window: {window_seconds}s, expected 60s")
 
+# Use windowSeconds from feed, not hardcoded value
 snapshot = TWAPSnapshot(
     timestamp=time.time(),
     twap_60s=data["value"],
-    window_seconds=data["windowSeconds"],
+    window_seconds=window_seconds,  # From feed, not invented
     source="chainlink_rtds",
     series_id=data.get("series", "btc-usd-twap-60s")
 )
@@ -155,19 +178,26 @@ Prefer:
 
 ### ✅ Implemented
 - windowSeconds field in TWAPSnapshot
-- Logging on pin_window_open
-- Logging in calculate_fair_value
-- 60s validation
-- Fee math (C × 0.07 × p × (1-p))
-- Spot fallback with windowSeconds=60 marked
+- Logging on pin_window_open, calculate_fair_value, and settle
+- 60s validation from feed (never invented)
+- Fee math (shares × 0.07 × p × (1-p), C = shares)
+- Depth-to-size cost in edge calculation
+- RTDS connection with API key auth
+- Spot fallback disabled for --execute mode
+- [TWAP_SETTLE] logging helper (log_twap_settle.py)
 
-### ⚠️ TODO for Production
-- Connect to RTDS endpoint
-- Add RTDS_API_KEY authentication
-- Add settlement logging (when position closes at expiry)
-- Add alerts for window mismatch
-- Disable spot fallback
-- Add RTDS connection health monitoring
+### ⚠️ Blockers for --execute
+- [ ] Set CHAINLINK_RTDS_ENDPOINT env var
+- [ ] Set CHAINLINK_RTDS_API_KEY env var
+- [ ] Verify RTDS connection returns windowSeconds=60
+- [ ] Test with dry-run first (spot fallback OK)
+- [ ] Monitor [RTDS] and [TWAP_*] logs
+
+### Production Requirements
+- RTDS endpoint and API key required for --execute
+- Dry-run mode uses spot fallback (clearly marked)
+- Never invent windowSeconds=60 on production path
+- Always validate windowSeconds from RTDS response
 
 ---
 

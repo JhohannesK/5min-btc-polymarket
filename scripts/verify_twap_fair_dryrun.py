@@ -21,9 +21,10 @@ from btc_5m_twap_fair import (
 def main():
     print("=== BTC 5m TWAP Fair Value Dry-Run Verification ===\n")
     
-    # Initialize TWAP tracker (fallback to spot)
+    # Initialize TWAP tracker (will use fallback for dry-run)
     print("1. Initializing TWAP tracker...")
-    tracker = ChainlinkTWAPTracker(fallback_to_spot=True)
+    print("   Note: No RTDS credentials - using spot fallback for dry-run")
+    tracker = ChainlinkTWAPTracker()
     
     # Get current TWAP
     print("2. Fetching current TWAP...")
