@@ -194,18 +194,22 @@ class FairValueCalculator:
         self.twap_tracker = twap_tracker
         self._window_pins: dict[str, TWAPSnapshot] = {}
     
-    def pin_window_open(self, market_slug: str) -> Optional[TWAPSnapshot]:
+    def pin_window_open(self, market_slug: str, allow_fallback: bool = True) -> Optional[TWAPSnapshot]:
         """
         Pin the TWAP at window open for a market.
         
         CRITICAL: Logs windowSeconds on every pin (ship-blocker requirement).
         Call this once when a new 5m market becomes active.
         Returns the pinned TWAP snapshot.
+        
+        Args:
+            market_slug: Market identifier
+            allow_fallback: If False, raises if RTDS not configured (for --execute mode)
         """
         if market_slug in self._window_pins:
             return self._window_pins[market_slug]
         
-        current = self.twap_tracker.get_current_twap()
+        current = self.twap_tracker.get_current_twap(allow_fallback=allow_fallback)
         if current:
             # SHIP-BLOCKER: Log windowSeconds to prevent silent 30s/60s mix
             print(f"[TWAP_PIN] market={market_slug} "
@@ -232,7 +236,8 @@ class FairValueCalculator:
         self,
         market_slug: str,
         seconds_left: float,
-        btc_daily_vol_pct: float = 3.5
+        btc_daily_vol_pct: float = 3.5,
+        allow_fallback: bool = True
     ) -> Optional[FairValue]:
         """
         Calculate fair P(Up) for a 5m market.
@@ -243,6 +248,7 @@ class FairValueCalculator:
             market_slug: Market identifier (e.g. btc-updown-5m-1234567890)
             seconds_left: Seconds remaining until settlement
             btc_daily_vol_pct: Estimated BTC daily volatility % (default 3.5%)
+            allow_fallback: If False, raises if RTDS not configured (for --execute mode)
         
         Returns:
             FairValue with P(Up), P(Down), and edge signal
@@ -250,13 +256,13 @@ class FairValueCalculator:
         # Get pinned window-open TWAP
         open_twap_snapshot = self._window_pins.get(market_slug)
         if open_twap_snapshot is None:
-            open_twap_snapshot = self.pin_window_open(market_slug)
+            open_twap_snapshot = self.pin_window_open(market_slug, allow_fallback=allow_fallback)
             if open_twap_snapshot is None:
                 return None
         open_twap = open_twap_snapshot.twap_60s
         
-        # Get current TWAP (allow_fallback passed through if needed)
-        current_snapshot = self.twap_tracker.get_current_twap(allow_fallback=True)
+        # Get current TWAP (allow_fallback passed through from caller)
+        current_snapshot = self.twap_tracker.get_current_twap(allow_fallback=allow_fallback)
         if current_snapshot is None:
             return None
         current_twap = current_snapshot.twap_60s
