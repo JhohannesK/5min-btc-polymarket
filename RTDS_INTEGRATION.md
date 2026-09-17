@@ -145,7 +145,7 @@ fee = C × 0.07 × p × (1-p)
 ```
 
 Where:
-- `C` = cost in USDC (shares × price)
+- `C` = shares (not USDC cost)
 - `p` = price (0 to 1)
 - Makers pay 0
 
