@@ -4,17 +4,38 @@ Open-source OpenClaw skill for **BTC 5-minute Up/Down** markets on Polymarket.
 
 Repository: https://github.com/Novals83/5min-btc-polymarket
 
-## Strategy (Momentum into Close)
-This skill is aligned with a short-horizon momentum strategy:
+## Strategy (TWAP Fair-Value Trading)
+This skill uses Chainlink BTC/USD 60s TWAP (the series Polymarket pays for settlement) to estimate fair value and trade when the market is mispriced:
 
-1. Trade BTC 5m event markets near expiry.
-2. Main entry window: around **2 minutes left**.
-3. Confirm that BTC has already moved by about **$70-$100** in the active interval.
-4. Check market skew (crowd positioning). If flow supports the move direction, enter **with** momentum.
-5. Typical sizing: around **50% of trading allocation** (user-defined risk tolerance).
-6. Optional micro-hedge when skew is extreme (for example, 95/5): place a small opposite position ($1-$2 equivalent) to reduce tail risk.
+### Settlement Rule
+Polymarket BTC 5m Up/Down markets resolve as:
+- **Up wins** if Chainlink BTC/USD 60s TWAP at window end ≥ TWAP at window open
+- **Down wins** otherwise
 
-This is a momentum-following approach, not a reversal strategy.
+### Entry Logic
+1. Pin the Chainlink 60s TWAP at window open
+2. Track live TWAP path during the 5-minute window
+3. Calculate fair P(Up) = P(TWAP_end ≥ TWAP_open) from current TWAP + residual vol
+4. **Trade the cheap side vs fair** when net edge > minimum threshold:
+   - Net edge = (fair value - book price) - costs
+   - Costs = crypto taker fee (7% × p × (1-p)) + half-spread
+   - Default min edge: 5 bps (conservative) or 3 bps (aggressive)
+
+### Exit Logic
+- **Hold to redeem** (EV = fair_p × $1.00) unless selling at current bid yields higher EV after fees
+- No legacy % stop-loss on mid prices
+- No panic sells at $0.01
+- Exit early only when bid ≥ hold-EV or time-based safety exit triggers
+
+### Risk Controls
+- **One ticket per 5m bucket** — enforced by state tracker
+- **Daily loss limit** — hard stop at $50 loss (configurable)
+- **Max trades per day** — 12 (conservative) or 20 (aggressive)
+- **Kill switch** — `runtime/.kill` file triggers immediate halt with flatten or hold action
+- **Spread/liquidity gates** — skip wide spreads or thin books
+
+### Legacy Mode
+Pass `--legacy-threshold-mode` to use old threshold-only entry logic (for comparison/debug only). Not recommended for live trading.
 
 ## Repository Structure
 - `SKILL.md` — skill definition and operating rules

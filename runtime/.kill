@@ -1,0 +1,6 @@
+# Kill switch file
+# Delete this file to re-enable trading
+# Actions:
+#   flatten: Cancel orders and close all positions
+#   hold: Cancel orders and hold positions to settlement
+action: flatten
