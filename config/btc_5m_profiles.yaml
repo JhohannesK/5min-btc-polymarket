@@ -33,6 +33,19 @@ shared_rules:
     monitor_continuous: true
     min_entry_seconds_left: 60
     exit_before_sec: 20
+    # W4 paper defaults. Re-validate on a short paper window before prod lock.
+    entry_timing:
+      enabled: true
+      bucket_seconds: 300
+      window_max_seconds_left: 240  # T-240
+      window_min_seconds_left: 45   # T-45
+      soft_skip_open_sec: 20
+      hard_skip_last_sec: 20
+      min_abs_fair_dev: 0.02
+      polarized_min_abs_fair_dev: 0.25
+      late_hold_ev_buffer_pp: 0.02
+      late_min_ask_notional_usd: 30
+      redeem_value: 1.0
   maker_pilot:
     # W6 post-only / GTD maker path. Shadow-first. Live posting is stubbed.
     # enabled=false by default. When enabled, shadow=true simulates quotes vs
@@ -64,10 +77,43 @@ profiles:
       threshold_price: 0.70
     twap_fair_value:
       enabled: true
+      model: projected_final_twap
       min_edge_bps: 5.0
       btc_daily_vol_pct: 3.5
       hold_to_redeem: true
-      description: "Trade the cheap side vs Chainlink TWAP fair when edge > costs. Hold to redeem unless bid >= hold-EV."
+      description: "W3 projected-final-TWAP: P(Up) from incomplete 60s path + remaining settle window. Not spot momentum. Hold to redeem unless bid >= hold-EV."
+    # W1/W2/W5 paper defaults. Re-validate spread/depth thresholds on a short
+    # paper window before locking prod numbers.
+    winmore:
+      min_edge_pp: 0.005  # 0.5c; gate is probability points, not bps-only
+      taker_fee_rate: 0.07
+      midband:
+        enabled: true
+        lower: 0.40
+        upper: 0.60
+        taker_policy: skip  # W1: ban takes when ask in [0.40, 0.60]
+        extra_min_edge_pp: 0.02
+      taker_delay:
+        # W2: Polymarket ~250ms / itode-style matching delay. Add 0.5-1.0c
+        # (vol-scaled around 3.5% daily vol, then clamped) to required net edge.
+        # Prefer GTD/post-only over FAK/FOK snipes. Dry-run stays default.
+        delay_ms: 250
+        buffer_pp: 0.005  # 0.5c at 3.5% daily vol
+        vol_scale: true
+        vol_ref_pct: 3.5
+        buffer_min_pp: 0.005  # 0.5c floor
+        buffer_max_pp: 0.010  # 1.0c cap
+        prefer_post_only: true
+        order_type_post_only: GTD
+        order_type_taker: FAK
+      sizing:
+        # W5: size <= depth within N ticks of touch; fractional Kelly x
+        # remaining daily loss budget; no second clip if edge decayed.
+        depth_ticks: 3
+        tick_size: 0.01
+        kelly_fraction: 0.25
+        edge_decay_ratio: 0.50
+        min_stake_usd: 1.0
     sizing:
       stake_mode: "fixed_or_cap"
       stake_usd: 5
@@ -110,10 +156,38 @@ profiles:
       threshold_price: 0.70
     twap_fair_value:
       enabled: true
+      model: projected_final_twap
       min_edge_bps: 3.0
       btc_daily_vol_pct: 3.5
       hold_to_redeem: true
-      description: "Trade the cheap side vs Chainlink TWAP fair when edge > costs. Hold to redeem unless bid >= hold-EV."
+      description: "W3 projected-final-TWAP: P(Up) from incomplete 60s path + remaining settle window. Not spot momentum. Hold to redeem unless bid >= hold-EV."
+    # W1/W2/W5 paper defaults. Re-validate on a short paper window before prod lock.
+    winmore:
+      min_edge_pp: 0.003  # 0.3c base; still plus delay buffer
+      taker_fee_rate: 0.07
+      midband:
+        enabled: true
+        lower: 0.40
+        upper: 0.60
+        taker_policy: raise_min_edge  # W1: allow mid-band if net edge clears extra bar
+        extra_min_edge_pp: 0.02
+      taker_delay:
+        # W2: ~250ms delay buffer. Aggressive uses 1.0c at 3.5% vol (still clamped).
+        delay_ms: 250
+        buffer_pp: 0.010  # 1.0c at 3.5% daily vol
+        vol_scale: true
+        vol_ref_pct: 3.5
+        buffer_min_pp: 0.005
+        buffer_max_pp: 0.010
+        prefer_post_only: true
+        order_type_post_only: GTD
+        order_type_taker: FAK
+      sizing:
+        depth_ticks: 3
+        tick_size: 0.01
+        kelly_fraction: 0.30
+        edge_decay_ratio: 0.50
+        min_stake_usd: 1.0
     sizing:
       stake_mode: "fixed_or_cap"
       stake_usd: 5
@@ -163,10 +237,15 @@ runner_mapping:
   example_aggressive_now: ".venv/bin/python scripts/test_btc_5m_session_exit_sl.py --threshold 0.70 --stake-usd 6 --stop-loss-pct 0.30 --exit-before-sec 20 --min-entry-seconds-left 60 --entry-timeout-min 60 --poll-sec 5 --execute"
 
 notes:
-  - "TWAP fair-value mode (default): Uses Chainlink BTC/USD 60s TWAP (the series Polymarket pays) to estimate fair P(Up). Trades the cheap side vs fair only when net edge (after fees + spread) > min_edge_bps."
-  - "Settlement rule: Up wins iff Chainlink 60s TWAP at window end >= TWAP at window open. Strategy pins window-open TWAP and calculates fair from live TWAP path + residual vol."
-  - "Entry: Trade when book price differs from fair by more than costs (crypto taker fee 7% * p * (1-p) + half-spread). Prefer maker when practical."
+  - "TWAP fair-value mode (default): W3 projected-final-TWAP. P(Up) from the incomplete 60s TWAP path plus residual vol on the remaining settle window. Spot momentum is ignored. Trades the cheap side vs fair only when net edge (after fees + spread) > min_edge_pp (W1 fee-aware gate in probability points)."
+  - "Settlement rule: Up wins iff Chainlink 60s TWAP at window end >= TWAP at window open. Pin window-open TWAP. Log source_ts, receipt_ts, decision_ts on PIN/CALC."
+  - "W4 entry timing: default window T-240 to T-45 when |fair-0.5| and net edge are clear. Soft-skip first ~20s of the bucket. Hard-skip last ~15-20s unless polarized ask <= hold-EV - buffer and depth is OK."
+  - "W1: Skip or raise min_edge when ask is in [0.40, 0.60]. fee_pp = 0.07*p*(1-p) + half_spread + depth_cost. Conservative skips mid-band takes; aggressive raises the bar."
+  - "W2: ~250ms / itode-style taker delay. Add 0.5-1.0c (vol-scaled, clamped) to required edge. Prefer GTD/post-only over FAK/FOK snipes. Dry-run remains default; do not pass --execute until paper-validated."
+  - "W5: Size <= depth within N ticks of the touch. Cap with fractional Kelly x remaining daily loss budget. Do not add a second clip if edge decayed after the first fill attempt."
+  - "Entry: Trade when book price differs from fair by more than costs (crypto taker fee 7% * p * (1-p) + half-spread + delay buffer). Prefer maker/GTD when practical."
   - "W6 maker_pilot: shadow-first post-only/GTD quotes vs book. Default enabled=false, shadow=true, live_execute=false. Live path is stubbed (still needs execute flag). Cancel on TWAP fair flip or spread widen. Paper-window before any live pilot."
   - "Exit: Hold to redeem (EV = fair_p * $1) unless selling at bid yields higher EV after fees. No legacy % stops on mid prices."
   - "Risk: One ticket per 5m bucket. Hard daily loss limit in dollars. Kill switch at runtime/.kill with flatten or hold action."
+  - "Uncertainty: re-validate W3/W4 paper-window thresholds (entry window, hard-skip last seconds, hold-EV buffer, depth, min_abs_fair_dev) and W1/W2/W5 spread/depth thresholds on a short paper window before locking prod numbers."
   - "Legacy threshold mode: Pass --legacy-threshold-mode to use old threshold/side-strength logic (for debug/comparison only)."

@@ -18,8 +18,12 @@ from py_clob_client.clob_types import ApiCreds
 from btc_5m_twap_fair import (
     ChainlinkTWAPTracker,
     FairValueCalculator,
-    estimate_trade_edge,
     calculate_hold_ev
+)
+from btc_5m_entry_timing import (
+    TimingDecision,
+    entry_timing_from_mapping,
+    evaluate_entry_timing,
 )
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
@@ -29,6 +33,15 @@ from btc_5m_maker_pilot import (
     SideBook,
     format_maker_pilot_report,
     summarize_maker_pilot,
+)
+from btc_5m_winmore_gates import (
+    EntryDecision,
+    WinmoreConfig,
+    decision_log_fields,
+    evaluate_side,
+    parse_book_levels,
+    select_entry,
+    winmore_config_from_mapping,
 )
 
 UTC = dt.timezone.utc
@@ -157,11 +170,38 @@ def _best_bid_ask(book) -> tuple[Optional[float], Optional[float]]:
     return best_bid, best_ask
 
 
+def _best_ask_notional(book) -> float:
+    """Top-of-book ask notional in USD (price * size). 0 if the book is empty."""
+    asks = getattr(book, 'asks', []) or []
+    best_p = None
+    best_sz = 0.0
+    for a in asks:
+        p = float(getattr(a, 'price', 0) or 0)
+        if p <= 0:
+            continue
+        sz = float(getattr(a, 'size', 0) or 0)
+        if best_p is None or p < best_p:
+            best_p = p
+            best_sz = sz
+    if best_p is None:
+        return 0.0
+    return best_p * best_sz
+
+
+def fetch_clob_books(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com'):
+    """Fetch both CLOB books once (asks+bids+depth)."""
+    pub = ClobClient(host=clob_base, chain_id=POLYGON)
+    return pub.get_order_book(str(up_token)), pub.get_order_book(str(down_token))
+
+
+def side_book_from_clob(side: str, token_id: str, book) -> SideBook:
+    bid, ask = _best_bid_ask(book)
+    return SideBook(side=side, token_id=str(token_id), best_bid=bid, best_ask=ask)
+
+
 def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com') -> tuple[Optional[float], Optional[float], Optional[float]]:
     """Return trigger prices from CLOB orderbooks: UP ask, DOWN ask, spread of picked side when available."""
-    pub = ClobClient(host=clob_base, chain_id=POLYGON)
-    up_book = pub.get_order_book(str(up_token))
-    dn_book = pub.get_order_book(str(down_token))
+    up_book, dn_book = fetch_clob_books(up_token, down_token, clob_base)
     up_bid, up_ask = _best_bid_ask(up_book)
     dn_bid, dn_ask = _best_bid_ask(dn_book)
 
@@ -181,14 +221,10 @@ def clob_side_books(
     down_token: str,
     clob_base: str = 'https://clob.polymarket.com',
 ) -> tuple[SideBook, SideBook]:
-    pub = ClobClient(host=clob_base, chain_id=POLYGON)
-    up_raw = pub.get_order_book(str(up_token))
-    dn_raw = pub.get_order_book(str(down_token))
-    up_bid, up_ask = _best_bid_ask(up_raw)
-    dn_bid, dn_ask = _best_bid_ask(dn_raw)
+    up_raw, dn_raw = fetch_clob_books(up_token, down_token, clob_base)
     return (
-        SideBook(side='UP', token_id=str(up_token), best_bid=up_bid, best_ask=up_ask),
-        SideBook(side='DOWN', token_id=str(down_token), best_bid=dn_bid, best_ask=dn_ask),
+        side_book_from_clob('UP', up_token, up_raw),
+        side_book_from_clob('DOWN', down_token, dn_raw),
     )
 
 
@@ -307,7 +343,14 @@ def cancel_token_orders(client: Optional[ClobClient], token_id: str) -> Optional
         return {'error': str(e)}
 
 
-def run_open(repo: str, slug: str, side: str, stake: float, execute: bool) -> tuple[str, list[dict[str, Any]]]:
+def run_open(
+    repo: str,
+    slug: str,
+    side: str,
+    stake: float,
+    execute: bool,
+    order_type: str = 'GTD',
+) -> tuple[str, list[dict[str, Any]]]:
     cmd = [
         '.venv/bin/python',
         'src/live/pm_live_trade_runner.py',
@@ -324,7 +367,8 @@ def run_open(repo: str, slug: str, side: str, stake: float, execute: bool) -> tu
     # Only override if not already set in environment
     env.setdefault('PM_MAX_SPREAD', '0.05')
     env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '10')
-    env.setdefault('PM_ORDER_TYPE', 'FAK')
+    # W2: honor prefer_post_only. Do not leave a sticky FAK env default in place.
+    env['PM_ORDER_TYPE'] = str(order_type or 'GTD').upper()
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, env=env)
     out = (p.stdout or '') + '\n' + (p.stderr or '')
     return out, parse_json_objects(out)
@@ -389,6 +433,10 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
             'maker_pilot': MakerPilotConfig().as_public_dict(),
+            'entry_timing': {},
+            'daily_max_loss_usd': 50.0,
+            'max_trades_per_day': 12,
+            'winmore': winmore_config_from_mapping(None),
         },
         'aggressive': {
             'threshold': 0.70,
@@ -403,6 +451,15 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
             'maker_pilot': MakerPilotConfig().as_public_dict(),
+            'entry_timing': {},
+            'daily_max_loss_usd': 50.0,
+            'max_trades_per_day': 20,
+            'winmore': winmore_config_from_mapping({
+                'min_edge_pp': 0.003,
+                'midband': {'taker_policy': 'raise_min_edge'},
+                'taker_delay': {'buffer_pp': 0.010},
+                'sizing': {'kelly_fraction': 0.30},
+            }),
         },
     }
     
@@ -423,6 +480,8 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             shared_mp = config.get('shared_rules', {}).get('maker_pilot', {}) or {}
             profile_mp = profile_data.get('maker_pilot', {}) or {}
             maker_pilot = {**shared_mp, **profile_mp}
+            entry_timing = dict(session_timing.get('entry_timing') or {})
+            entry_timing.update(twap_fair.get('entry_timing') or {})
 
             profiles[profile_name] = {
                 'threshold': signal.get('threshold_price', 0.70),
@@ -437,6 +496,10 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
                 'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
                 'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
                 'maker_pilot': maker_pilot,
+                'entry_timing': entry_timing,
+                'daily_max_loss_usd': float(sizing.get('daily_max_loss_usd', 50.0)),
+                'max_trades_per_day': int(sizing.get('max_trades_per_day', 20)),
+                'winmore': winmore_config_from_mapping(profile_data.get('winmore')),
             }
         
         return profiles if profiles else fallback_profiles
@@ -476,6 +539,11 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.maker_pilot_cfg['enabled'] = True
         args.maker_pilot_cfg['shadow'] = True
         args.maker_pilot_cfg['live_execute'] = False
+    args.entry_timing_cfg = entry_timing_from_mapping(prof.get('entry_timing'))
+    args.daily_max_loss_usd = float(prof.get('daily_max_loss_usd', 50.0))
+    args.max_trades_per_day = int(prof.get('max_trades_per_day', 20))
+    wm = prof.get('winmore')
+    args.winmore = wm if isinstance(wm, WinmoreConfig) else winmore_config_from_mapping(wm)
     return args
 
 
@@ -550,9 +618,10 @@ def main():
     # Initialize state tracker for one-ticket-per-bucket and daily limits
     state_tracker = StateTracker(
         state_dir=Path(__file__).parent.parent / 'runtime' / 'state',
-        daily_loss_limit_usd=50.0,
-        max_trades_per_day=20
+        daily_loss_limit_usd=float(args.daily_max_loss_usd),
+        max_trades_per_day=int(args.max_trades_per_day),
     )
+    winmore_cfg: WinmoreConfig = args.winmore
 
     mp_cfg = MakerPilotConfig.from_mapping(getattr(args, 'maker_pilot_cfg', None))
     maker_engine = MakerPilotEngine(mp_cfg)
@@ -578,6 +647,23 @@ def main():
             'hold_to_redeem': args.hold_to_redeem,
             'legacy_threshold_mode': args.legacy_threshold_mode,
             'maker_pilot': mp_cfg.as_public_dict(),
+            'entry_timing': {
+                'window_max_seconds_left': args.entry_timing_cfg.window_max_seconds_left,
+                'window_min_seconds_left': args.entry_timing_cfg.window_min_seconds_left,
+                'soft_skip_open_sec': args.entry_timing_cfg.soft_skip_open_sec,
+                'hard_skip_last_sec': args.entry_timing_cfg.hard_skip_last_sec,
+            },
+            'winmore': {
+                'min_edge_pp': winmore_cfg.min_edge_pp,
+                'midband_taker_policy': winmore_cfg.midband_taker_policy,
+                'midband': [winmore_cfg.midband_lower, winmore_cfg.midband_upper],
+                'taker_delay_ms': winmore_cfg.taker_delay_ms,
+                'taker_delay_buffer_pp': winmore_cfg.taker_delay_buffer_pp,
+                'prefer_post_only': winmore_cfg.prefer_post_only,
+                'depth_ticks': winmore_cfg.depth_ticks,
+                'kelly_fraction': winmore_cfg.kelly_fraction,
+            },
+            'daily_max_loss_usd': args.daily_max_loss_usd,
         },
         'attempts': [],
         'maker_pilot_events': [],
@@ -585,6 +671,8 @@ def main():
 
     deadline = time.time() + args.entry_timeout_min * 60
     opened = None
+    # W5: first fill-attempt net edge per bucket; block a second clip if edge decayed.
+    fill_attempts: dict[int, float] = {}
     
     # Daily summary at start
     daily_summary = state_tracker.get_daily_summary()
@@ -640,28 +728,31 @@ def main():
                 time.sleep(args.poll_sec)
                 continue
 
-            # CLOB books (bid+ask) for maker shadow and taker edge.
+            # CLOB books: asks, bids, depth (fetched once per poll).
             try:
-                up_book, dn_book = clob_side_books(up_t, dn_t)
+                up_raw, dn_raw = fetch_clob_books(up_t, dn_t)
             except Exception as e:
                 report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
                 time.sleep(args.poll_sec)
                 continue
 
-            up_ask, dn_ask = up_book.best_ask, dn_book.best_ask
-            up_bid, dn_bid = up_book.best_bid, dn_book.best_bid
-            min_spread = _min_spread(up_book, dn_book)
+            up_bid, up_ask = _best_bid_ask(up_raw)
+            dn_bid, dn_ask = _best_bid_ask(dn_raw)
+            up_side_book = side_book_from_clob('UP', up_t, up_raw)
+            dn_side_book = side_book_from_clob('DOWN', dn_t, dn_raw)
+            min_spread = _min_spread(up_side_book, dn_side_book)
 
-            # Too late to enter: cancel any resting shadow quote, do not post.
-            if sec_left < args.min_entry_seconds_left:
+            # Legacy blunt late-entry skip. Fair-value path uses W4 timing instead.
+            # Maker shadow still ticks so resting quotes cancel when the window is gone.
+            if sec_left < args.min_entry_seconds_left and (maker_on or not use_fair_value):
                 if maker_on:
                     run_maker_pilot_tick(
                         maker_engine,
                         report,
                         now=time.time(),
                         fair_signal='unavailable',
-                        up_book=up_book,
-                        down_book=dn_book,
+                        up_book=up_side_book,
+                        down_book=dn_side_book,
                         stake_usd=args.stake_usd,
                         execute=args.execute,
                         rtds_ready=False,
@@ -678,7 +769,6 @@ def main():
                 })
                 time.sleep(args.poll_sec)
                 continue
-
             report['attempts'].append({
                 'ts': ts_utc(),
                 'slug': slug,
@@ -710,8 +800,8 @@ def main():
                         report,
                         now=time.time(),
                         fair_signal=wide_sig,
-                        up_book=up_book,
-                        down_book=dn_book,
+                        up_book=up_side_book,
+                        down_book=dn_side_book,
                         stake_usd=args.stake_usd,
                         execute=args.execute,
                         rtds_ready=bool(args.execute),
@@ -729,6 +819,10 @@ def main():
                 })
                 time.sleep(args.poll_sec)
                 continue
+
+            entry_stake = args.stake_usd
+            entry_order_type = 'FAK'
+            twap_entry_net_edge: Optional[float] = None
 
             # Entry logic: TWAP fair value or legacy threshold
             if use_fair_value and fair_calc is not None:
@@ -762,8 +856,8 @@ def main():
                             report,
                             now=time.time(),
                             fair_signal='unavailable',
-                            up_book=up_book,
-                            down_book=dn_book,
+                            up_book=up_side_book,
+                            down_book=dn_side_book,
                             stake_usd=args.stake_usd,
                             execute=args.execute,
                             rtds_ready=bool(args.execute),
@@ -779,38 +873,63 @@ def main():
                     })
                     time.sleep(args.poll_sec)
                     continue
-                
-                # Bids already loaded with asks via clob_side_books.
-                up_shares = args.stake_usd / up_ask if up_ask and up_ask > 0 else 0
-                dn_shares = args.stake_usd / dn_ask if dn_ask and dn_ask > 0 else 0
-                
-                up_edge = estimate_trade_edge(
+
+                remaining_budget = state_tracker.remaining_loss_budget_usd()
+                prior_edge = fill_attempts.get(current_bucket)
+                up_levels = parse_book_levels(getattr(up_raw, 'asks', None))
+                dn_levels = parse_book_levels(getattr(dn_raw, 'asks', None))
+                up_ask_notional = _best_ask_notional(up_raw)
+                dn_ask_notional = _best_ask_notional(dn_raw)
+
+                up_decision = evaluate_side(
+                    'UP',
                     fair_value.p_up,
-                    up_ask if up_ask is not None else 0.99,
-                    up_bid if up_bid is not None else 0.01,
-                    shares=up_shares
-                ) if up_ask is not None else None
-                
-                dn_edge = estimate_trade_edge(
+                    up_ask,
+                    up_bid,
+                    up_levels,
+                    winmore_cfg,
+                    args.stake_usd,
+                    remaining_budget,
+                    args.btc_daily_vol_pct,
+                    prior_net_edge_pp=prior_edge,
+                )
+                dn_decision = evaluate_side(
+                    'DOWN',
                     fair_value.p_down,
-                    dn_ask if dn_ask is not None else 0.99,
-                    dn_bid if dn_bid is not None else 0.01,
-                    shares=dn_shares
-                ) if dn_ask is not None else None
-                
+                    dn_ask,
+                    dn_bid,
+                    dn_levels,
+                    winmore_cfg,
+                    args.stake_usd,
+                    remaining_budget,
+                    args.btc_daily_vol_pct,
+                    prior_net_edge_pp=prior_edge,
+                )
+                decision = select_entry(up_decision, dn_decision)
+
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
-                    'status': 'fair_value_check',
+                    'status': 'fair_value_winmore_gate',
                     'fair_p_up': fair_value.p_up,
                     'fair_p_down': fair_value.p_down,
                     'window_open_twap': fair_value.window_open_twap,
                     'current_twap': fair_value.current_twap,
+                    'projected_final_twap': fair_value.projected_final_twap,
+                    'locked_frac': fair_value.locked_frac,
+                    'remaining_frac': fair_value.remaining_frac,
+                    'fair_model': fair_value.model,
                     'edge_signal': fair_value.edge_signal,
+                    'source': fair_value.source,
+                    'source_ts': fair_value.source_ts,
+                    'receipt_ts': fair_value.receipt_ts,
+                    'decision_ts': fair_value.decision_ts,
                     'up_ask': up_ask,
                     'dn_ask': dn_ask,
-                    'up_edge_bps': up_edge['net_edge_bps'] if up_edge else None,
-                    'dn_edge_bps': dn_edge['net_edge_bps'] if dn_edge else None,
+                    'up_gate': decision_log_fields(up_decision),
+                    'dn_gate': decision_log_fields(dn_decision),
+                    'picked': decision_log_fields(decision),
+                    'remaining_loss_budget_usd': remaining_budget,
                     'seconds_left': sec_left,
                 })
 
@@ -820,8 +939,8 @@ def main():
                         report,
                         now=time.time(),
                         fair_signal=fair_value.edge_signal,
-                        up_book=up_book,
-                        down_book=dn_book,
+                        up_book=up_side_book,
+                        down_book=dn_side_book,
                         stake_usd=args.stake_usd,
                         execute=args.execute,
                         rtds_ready=bool(args.execute),
@@ -831,36 +950,87 @@ def main():
                     )
                     time.sleep(args.poll_sec)
                     continue
-                
-                # Select side with best positive edge
-                candidates: list[tuple[str, float, dict]] = []
-                if up_edge and up_edge['net_edge_bps'] >= args.min_edge_bps:
-                    candidates.append(('UP', up_edge['net_edge_bps'], up_edge))
-                if dn_edge and dn_edge['net_edge_bps'] >= args.min_edge_bps:
-                    candidates.append(('DOWN', dn_edge['net_edge_bps'], dn_edge))
-                
-                if not candidates:
+
+                if not decision.allow:
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
-                        'status': 'skip_no_positive_edge',
-                        'min_edge_bps': args.min_edge_bps,
-                        'up_edge_bps': up_edge['net_edge_bps'] if up_edge else None,
-                        'dn_edge_bps': dn_edge['net_edge_bps'] if dn_edge else None,
+                        'status': decision.reason,
+                        'min_edge_pp': winmore_cfg.min_edge_pp,
+                        'required_min_edge_pp': decision.required_min_edge_pp,
+                        'up_net_edge_pp': up_decision.net_edge_pp,
+                        'dn_net_edge_pp': dn_decision.net_edge_pp,
                         'seconds_left': sec_left,
                     })
                     time.sleep(args.poll_sec)
                     continue
-                
-                side, best_edge_bps, edge_details = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
-                trigger_price = edge_details['book_ask']
-                report['entry_edge_details'] = edge_details
+
+                timed: list[tuple[EntryDecision, TimingDecision]] = []
+                for cand in (up_decision, dn_decision):
+                    if not cand.allow or not cand.side:
+                        continue
+                    fair_p_side = fair_value.p_up if cand.side == 'UP' else fair_value.p_down
+                    notional = up_ask_notional if cand.side == 'UP' else dn_ask_notional
+                    timing = evaluate_entry_timing(
+                        seconds_left=sec_left,
+                        fair_p=fair_p_side,
+                        ask=cand.entry_price,
+                        net_edge_bps=cand.net_edge_pp * 10000.0,
+                        min_edge_bps=cand.required_min_edge_pp * 10000.0,
+                        top_ask_notional_usd=notional,
+                        cfg=args.entry_timing_cfg,
+                    )
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'entry_timing_check',
+                        'side': cand.side,
+                        'allow': timing.allow,
+                        'reason': timing.reason,
+                        'zone': timing.zone,
+                        'seconds_left': sec_left,
+                        'abs_fair_dev': timing.abs_fair_dev,
+                        'top_ask_notional_usd': notional,
+                    })
+                    if timing.allow:
+                        timed.append((cand, timing))
+
+                if not timed:
+                    report['attempts'].append({
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_entry_timing',
+                        'seconds_left': sec_left,
+                    })
+                    time.sleep(args.poll_sec)
+                    continue
+
+                decision, timing = sorted(timed, key=lambda x: x[0].net_edge_pp, reverse=True)[0]
+                side = str(decision.side)
+                trigger_price = decision.entry_price
+                entry_stake = decision.size_usd
+                entry_order_type = decision.order_type
+                twap_entry_net_edge = decision.net_edge_pp
+                report['entry_edge_details'] = decision_log_fields(decision)
+                report['entry_timing'] = {
+                    'reason': timing.reason,
+                    'zone': timing.zone,
+                    'seconds_left': sec_left,
+                }
                 report['entry_fair_value'] = {
                     'p_up': fair_value.p_up,
                     'p_down': fair_value.p_down,
                     'window_open_twap': fair_value.window_open_twap,
                     'current_twap': fair_value.current_twap,
+                    'projected_final_twap': fair_value.projected_final_twap,
+                    'locked_frac': fair_value.locked_frac,
+                    'remaining_frac': fair_value.remaining_frac,
+                    'model': fair_value.model,
                     'edge_signal': fair_value.edge_signal,
+                    'source': fair_value.source,
+                    'source_ts': fair_value.source_ts,
+                    'receipt_ts': fair_value.receipt_ts,
+                    'decision_ts': fair_value.decision_ts,
                 }
             else:
                 # Legacy threshold-only mode
@@ -884,8 +1054,17 @@ def main():
                     continue
 
                 side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+                entry_stake = args.stake_usd
+                entry_order_type = 'FAK'
 
-            out, objs = run_open(args.repo, slug, side, args.stake_usd, args.execute)
+            out, objs = run_open(
+                args.repo,
+                slug,
+                side,
+                entry_stake,
+                args.execute,
+                order_type=entry_order_type,
+            )
             post = None
             runner = None
             for o in objs:
@@ -929,6 +1108,8 @@ def main():
                 break
             else:
                 report['last_open_try'] = out[-2000:]
+                if twap_entry_net_edge is not None:
+                    fill_attempts[current_bucket] = twap_entry_net_edge
         except Exception as e:
             report['attempts'].append({'ts': ts_utc(), 'status': 'error', 'error': str(e)})
         time.sleep(args.poll_sec)
@@ -1243,10 +1424,12 @@ def main():
         window_open_twap = fair_calc.get_window_open_twap(opened['market_slug'])
         if window_open_twap is not None and held_to_redeem:
             try:
+                allow_fallback = not args.execute
                 settle_result = log_twap_settle(
                     opened['market_slug'],
                     window_open_twap,
-                    opened['side']
+                    opened['side'],
+                    allow_fallback=allow_fallback
                 )
                 report['twap_settlement'] = settle_result
             except Exception as e:
