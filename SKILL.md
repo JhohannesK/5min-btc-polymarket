@@ -12,6 +12,7 @@ description: Run and monitor BTC 5-minute Up/Down trading on Polymarket using Ch
 - TWAP fair value module: `scripts/btc_5m_twap_fair.py`
 - Entry timing (W4): `scripts/btc_5m_entry_timing.py`
 - W1/W2/W5 win-more gates: `scripts/btc_5m_winmore_gates.py`
+- Maker/post-only shadow pilot (W6): `scripts/btc_5m_maker_pilot.py`
 - State tracker: `scripts/btc_5m_state_tracker.py`
 - Skill control entrypoint: `scripts/btc5m_ctl.sh`
 - Compatibility wrapper (deprecated): `scripts/run_btc_5m_threshold_test.py`
@@ -27,6 +28,7 @@ Use this skill when the operator wants to execute a BTC 5m TWAP fair-value strat
 - Default is dry-run unless `--execute` is set. Do not enable `--execute` until W1-W5 paper numbers are re-validated.
 - W3 projected-final-TWAP fair; W4 entry window T-240 to T-45 (soft-skip open, hard-skip last ~20s unless polarized hold-EV exception).
 - TWAP entries go through win-more gates: mid-band taker ban / fee_pp, 250ms delay buffer + GTD/post-only, depth+Kelly sizing, no second clip on decay.
+- W6 maker_pilot is shadow-first and off by default (`enabled: false`, `shadow: true`, `live_execute: false`). Live maker posting is stubbed and still requires the execute flag; it does not unlock live trading.
 - Use controlled stake sizing (`--stake-usd`, profile caps, then W5 depth/Kelly cap).
 - If both UP and DOWN satisfy threshold logic, choose the stronger side.
 - Keep stop-loss and timing guards enabled in profile config.

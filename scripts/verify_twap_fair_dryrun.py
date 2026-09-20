@@ -25,6 +25,13 @@ from btc_5m_winmore_gates import (
     winmore_config_from_mapping,
     choose_entry_order_type,
 )
+from btc_5m_maker_pilot import (
+    MakerPilotConfig,
+    MakerPilotEngine,
+    SideBook,
+    format_maker_pilot_report,
+    summarize_maker_pilot,
+)
 
 
 def main():
@@ -116,7 +123,7 @@ def main():
     print(f"   ✓ soft-skip open: {soft.reason} allow={soft.allow}")
     print(f"   ✓ hard-skip last: {hard.reason} allow={hard.allow}")
     print(f"   ✓ late polarized: {late_ok.reason} allow={late_ok.allow}")
-    
+
     # Test win-more gates (W1/W2/W5) without live credentials
     print("\n10. Testing W1/W2/W5 win-more gates (dry-run, no execute)...")
     wm = winmore_config_from_mapping(None)
@@ -138,6 +145,27 @@ def main():
     print("   ✓ W2 GTD/post-only default + delay buffer in required min")
     print("   ✓ W5 depth/Kelly sizing on allowed wing print above")
 
+    print("\n11. W6 maker/post-only shadow (no live orders)...")
+    cfg = MakerPilotConfig(enabled=True, shadow=True, gtd_ttl_sec=15.0)
+    eng = MakerPilotEngine(cfg)
+    up = SideBook(side="UP", token_id="up", best_bid=0.44, best_ask=0.46)
+    dn = SideBook(side="DOWN", token_id="dn", best_bid=0.54, best_ask=0.56)
+    eng.on_tick(now=1000.0, fair_signal="up_favored", up_book=up, down_book=dn, stake_usd=5.0, bucket=1)
+    eng.on_tick(
+        now=1002.0,
+        fair_signal="down_favored",
+        up_book=up,
+        down_book=dn,
+        stake_usd=5.0,
+        bucket=1,
+    )
+    summary = summarize_maker_pilot(eng.events, eng.quotes)
+    print(format_maker_pilot_report(summary))
+    if summary["cancels_fair_flip"] != 1 or summary["live_posts_attempted"] != 0:
+        print("   ❌ Maker shadow cancel-on-flip / live-stub check failed")
+        return 1
+    print("   ✓ Shadow post + cancel on TWAP fair flip")
+    print("   ✓ Live path stubbed (0 live posts)")
     print("\n=== Verification Complete ===")
     print("✓ All components working without live Polymarket credentials")
     print("✓ TWAP tracker operational (using spot fallback)")
@@ -147,6 +175,7 @@ def main():
     print("✓ W3 projected-final-TWAP early/late consistent")
     print("✓ W4 entry-timing gates functional")
     print("✓ W1/W2/W5 win-more gates functional")
+    print("✓ W6 maker shadow path working (cancel-on-flip, live stubbed)")
     print("\n⚠️  PRODUCTION REQUIREMENTS:")
     print("   - Connect to RTDS topic: crypto_prices_twap_sixty")
     print("   - Filter: {\"symbol\":\"btc/usd\"}")

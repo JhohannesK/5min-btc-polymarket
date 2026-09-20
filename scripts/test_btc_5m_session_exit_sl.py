@@ -27,6 +27,13 @@ from btc_5m_entry_timing import (
 )
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
+from btc_5m_maker_pilot import (
+    MakerPilotConfig,
+    MakerPilotEngine,
+    SideBook,
+    format_maker_pilot_report,
+    summarize_maker_pilot,
+)
 from btc_5m_winmore_gates import (
     EntryDecision,
     WinmoreConfig,
@@ -187,6 +194,11 @@ def fetch_clob_books(up_token: str, down_token: str, clob_base: str = 'https://c
     return pub.get_order_book(str(up_token)), pub.get_order_book(str(down_token))
 
 
+def side_book_from_clob(side: str, token_id: str, book) -> SideBook:
+    bid, ask = _best_bid_ask(book)
+    return SideBook(side=side, token_id=str(token_id), best_bid=bid, best_ask=ask)
+
+
 def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com') -> tuple[Optional[float], Optional[float], Optional[float]]:
     """Return trigger prices from CLOB orderbooks: UP ask, DOWN ask, spread of picked side when available."""
     up_book, dn_book = fetch_clob_books(up_token, down_token, clob_base)
@@ -202,6 +214,73 @@ def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://c
         picked_spread = s if picked_spread is None else min(picked_spread, s)
 
     return up_ask, dn_ask, picked_spread
+
+
+def clob_side_books(
+    up_token: str,
+    down_token: str,
+    clob_base: str = 'https://clob.polymarket.com',
+) -> tuple[SideBook, SideBook]:
+    up_raw, dn_raw = fetch_clob_books(up_token, down_token, clob_base)
+    return (
+        side_book_from_clob('UP', up_token, up_raw),
+        side_book_from_clob('DOWN', down_token, dn_raw),
+    )
+
+
+def _min_spread(up_book: SideBook, dn_book: SideBook) -> Optional[float]:
+    spreads = [s for s in (up_book.spread, dn_book.spread) if s is not None]
+    if not spreads:
+        return None
+    return min(spreads)
+
+
+def run_maker_pilot_tick(
+    engine: MakerPilotEngine,
+    report: dict[str, Any],
+    *,
+    now: float,
+    fair_signal: str,
+    up_book: SideBook,
+    down_book: SideBook,
+    stake_usd: float,
+    execute: bool,
+    rtds_ready: bool,
+    bucket: int,
+    slug: str,
+    seconds_left: Optional[float],
+) -> list[dict[str, Any]]:
+    if not engine.config.enabled:
+        return []
+    events = engine.on_tick(
+        now=now,
+        fair_signal=fair_signal,
+        up_book=up_book,
+        down_book=down_book,
+        stake_usd=stake_usd,
+        execute=execute,
+        rtds_ready=rtds_ready,
+        creds_ready=False,
+        bucket=bucket,
+        market_slug=slug,
+        seconds_left=seconds_left,
+    )
+    if events:
+        report.setdefault('maker_pilot_events', []).extend(events)
+        report['attempts'].append({
+            'ts': ts_utc(),
+            'slug': slug,
+            'status': 'maker_pilot_tick',
+            'events': [e.get('event') for e in events],
+            'reasons': [e.get('reason') for e in events if e.get('reason')],
+        })
+    return events
+
+
+def attach_maker_pilot_summary(report: dict[str, Any], engine: MakerPilotEngine) -> None:
+    summary = summarize_maker_pilot(engine.events, engine.quotes)
+    report['maker_pilot'] = summary
+    report['maker_pilot_report'] = format_maker_pilot_report(summary)
 
 
 def clob_best_bid(token_id: str, clob_base: str = 'https://clob.polymarket.com') -> Optional[float]:
@@ -353,6 +432,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 5.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'maker_pilot': MakerPilotConfig().as_public_dict(),
             'entry_timing': {},
             'daily_max_loss_usd': 50.0,
             'max_trades_per_day': 12,
@@ -370,6 +450,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             'min_edge_bps': 3.0,
             'btc_daily_vol_pct': 3.5,
             'hold_to_redeem': True,
+            'maker_pilot': MakerPilotConfig().as_public_dict(),
             'entry_timing': {},
             'daily_max_loss_usd': 50.0,
             'max_trades_per_day': 20,
@@ -396,9 +477,12 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             stop_loss = profile_data.get('stop_loss', {})
             session_timing = config.get('shared_rules', {}).get('session_timing', {})
             twap_fair = profile_data.get('twap_fair_value', {})
+            shared_mp = config.get('shared_rules', {}).get('maker_pilot', {}) or {}
+            profile_mp = profile_data.get('maker_pilot', {}) or {}
+            maker_pilot = {**shared_mp, **profile_mp}
             entry_timing = dict(session_timing.get('entry_timing') or {})
             entry_timing.update(twap_fair.get('entry_timing') or {})
-            
+
             profiles[profile_name] = {
                 'threshold': signal.get('threshold_price', 0.70),
                 'stake_usd': sizing.get('stake_usd', 5.0),
@@ -411,6 +495,7 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
                 'min_edge_bps': twap_fair.get('min_edge_bps', 5.0),
                 'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
                 'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
+                'maker_pilot': maker_pilot,
                 'entry_timing': entry_timing,
                 'daily_max_loss_usd': float(sizing.get('daily_max_loss_usd', 50.0)),
                 'max_trades_per_day': int(sizing.get('max_trades_per_day', 20)),
@@ -449,6 +534,11 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
     if args.hold_to_redeem is None:
         args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
+    args.maker_pilot_cfg = dict(prof.get('maker_pilot') or {})
+    if getattr(args, 'maker_pilot', False):
+        args.maker_pilot_cfg['enabled'] = True
+        args.maker_pilot_cfg['shadow'] = True
+        args.maker_pilot_cfg['live_execute'] = False
     args.entry_timing_cfg = entry_timing_from_mapping(prof.get('entry_timing'))
     args.daily_max_loss_usd = float(prof.get('daily_max_loss_usd', 50.0))
     args.max_trades_per_day = int(prof.get('max_trades_per_day', 20))
@@ -507,6 +597,11 @@ def main():
     ap.add_argument('--btc-daily-vol-pct', type=float, default=None, help='BTC daily vol % for fair value calc (default 3.5)')
     ap.add_argument('--hold-to-redeem', type=bool, default=None, help='Hold to redeem unless bid >= hold-EV (default True)')
     ap.add_argument('--legacy-threshold-mode', action='store_true', help='Use legacy threshold-only mode (for debug/comparison)')
+    ap.add_argument(
+        '--maker-pilot',
+        action='store_true',
+        help='Enable W6 maker/post-only shadow pilot. Forces shadow; does not enable live execute.',
+    )
     ap.add_argument('--execute', action='store_true')
     args = apply_profile(ap.parse_args())
 
@@ -528,6 +623,10 @@ def main():
     )
     winmore_cfg: WinmoreConfig = args.winmore
 
+    mp_cfg = MakerPilotConfig.from_mapping(getattr(args, 'maker_pilot_cfg', None))
+    maker_engine = MakerPilotEngine(mp_cfg)
+    maker_on = mp_cfg.enabled and use_fair_value
+
     report: dict[str, Any] = {
         'started_at': ts_utc(),
         'params': {
@@ -547,6 +646,7 @@ def main():
             'btc_daily_vol_pct': args.btc_daily_vol_pct if use_fair_value else None,
             'hold_to_redeem': args.hold_to_redeem,
             'legacy_threshold_mode': args.legacy_threshold_mode,
+            'maker_pilot': mp_cfg.as_public_dict(),
             'entry_timing': {
                 'window_max_seconds_left': args.entry_timing_cfg.window_max_seconds_left,
                 'window_min_seconds_left': args.entry_timing_cfg.window_min_seconds_left,
@@ -566,6 +666,7 @@ def main():
             'daily_max_loss_usd': args.daily_max_loss_usd,
         },
         'attempts': [],
+        'maker_pilot_events': [],
     }
 
     deadline = time.time() + args.entry_timeout_min * 60
@@ -588,6 +689,7 @@ def main():
                 }
                 report['result'] = f'kill_switch_{kill_action}'
                 report['finished_at'] = ts_utc()
+                attach_maker_pilot_summary(report, maker_engine)
                 print(json.dumps(report, ensure_ascii=False, indent=2))
                 return
             
@@ -626,8 +728,38 @@ def main():
                 time.sleep(args.poll_sec)
                 continue
 
+            # CLOB books: asks, bids, depth (fetched once per poll).
+            try:
+                up_raw, dn_raw = fetch_clob_books(up_t, dn_t)
+            except Exception as e:
+                report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
+                time.sleep(args.poll_sec)
+                continue
+
+            up_bid, up_ask = _best_bid_ask(up_raw)
+            dn_bid, dn_ask = _best_bid_ask(dn_raw)
+            up_side_book = side_book_from_clob('UP', up_t, up_raw)
+            dn_side_book = side_book_from_clob('DOWN', dn_t, dn_raw)
+            min_spread = _min_spread(up_side_book, dn_side_book)
+
             # Legacy blunt late-entry skip. Fair-value path uses W4 timing instead.
-            if (not use_fair_value) and sec_left < args.min_entry_seconds_left:
+            # Maker shadow still ticks so resting quotes cancel when the window is gone.
+            if sec_left < args.min_entry_seconds_left and (maker_on or not use_fair_value):
+                if maker_on:
+                    run_maker_pilot_tick(
+                        maker_engine,
+                        report,
+                        now=time.time(),
+                        fair_signal='unavailable',
+                        up_book=up_side_book,
+                        down_book=dn_side_book,
+                        stake_usd=args.stake_usd,
+                        execute=args.execute,
+                        rtds_ready=False,
+                        bucket=current_bucket,
+                        slug=slug,
+                        seconds_left=sec_left,
+                    )
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
@@ -637,24 +769,6 @@ def main():
                 })
                 time.sleep(args.poll_sec)
                 continue
-
-            # CLOB books: asks, bids, depth (fetched once per poll).
-            try:
-                up_book, dn_book = fetch_clob_books(up_t, dn_t)
-            except Exception as e:
-                report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
-                time.sleep(args.poll_sec)
-                continue
-
-            up_bid, up_ask = _best_bid_ask(up_book)
-            dn_bid, dn_ask = _best_bid_ask(dn_book)
-            min_spread = None
-            if up_ask is not None and up_bid is not None:
-                min_spread = max(0.0, up_ask - up_bid)
-            if dn_ask is not None and dn_bid is not None:
-                s = max(0.0, dn_ask - dn_bid)
-                min_spread = s if min_spread is None else min(min_spread, s)
-
             report['attempts'].append({
                 'ts': ts_utc(),
                 'slug': slug,
@@ -670,6 +784,31 @@ def main():
             # Enforce spread gate: skip if spread is too wide
             max_spread = 0.03
             if min_spread is not None and min_spread > max_spread:
+                if maker_on:
+                    wide_sig = 'unavailable'
+                    if fair_calc is not None:
+                        try:
+                            fv_wide = fair_calc.calculate_fair_value(
+                                slug, sec_left, args.btc_daily_vol_pct, allow_fallback=not args.execute
+                            )
+                            if fv_wide is not None:
+                                wide_sig = fv_wide.edge_signal
+                        except Exception:
+                            pass
+                    run_maker_pilot_tick(
+                        maker_engine,
+                        report,
+                        now=time.time(),
+                        fair_signal=wide_sig,
+                        up_book=up_side_book,
+                        down_book=dn_side_book,
+                        stake_usd=args.stake_usd,
+                        execute=args.execute,
+                        rtds_ready=bool(args.execute),
+                        bucket=current_bucket,
+                        slug=slug,
+                        seconds_left=sec_left,
+                    )
                 report['attempts'].append({
                     'ts': ts_utc(),
                     'slug': slug,
@@ -696,6 +835,7 @@ def main():
                         report['rtds_check_failed'] = str(e)
                         report['result'] = 'rtds_required_for_execute'
                         report['finished_at'] = ts_utc()
+                        attach_maker_pilot_summary(report, maker_engine)
                         print(json.dumps(report, ensure_ascii=False, indent=2))
                         return
                 
@@ -710,6 +850,21 @@ def main():
                 )
                 
                 if fair_value is None:
+                    if maker_on:
+                        run_maker_pilot_tick(
+                            maker_engine,
+                            report,
+                            now=time.time(),
+                            fair_signal='unavailable',
+                            up_book=up_side_book,
+                            down_book=dn_side_book,
+                            stake_usd=args.stake_usd,
+                            execute=args.execute,
+                            rtds_ready=bool(args.execute),
+                            bucket=current_bucket,
+                            slug=slug,
+                            seconds_left=sec_left,
+                        )
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -721,10 +876,10 @@ def main():
 
                 remaining_budget = state_tracker.remaining_loss_budget_usd()
                 prior_edge = fill_attempts.get(current_bucket)
-                up_levels = parse_book_levels(getattr(up_book, 'asks', None))
-                dn_levels = parse_book_levels(getattr(dn_book, 'asks', None))
-                up_ask_notional = _best_ask_notional(up_book)
-                dn_ask_notional = _best_ask_notional(dn_book)
+                up_levels = parse_book_levels(getattr(up_raw, 'asks', None))
+                dn_levels = parse_book_levels(getattr(dn_raw, 'asks', None))
+                up_ask_notional = _best_ask_notional(up_raw)
+                dn_ask_notional = _best_ask_notional(dn_raw)
 
                 up_decision = evaluate_side(
                     'UP',
@@ -777,6 +932,24 @@ def main():
                     'remaining_loss_budget_usd': remaining_budget,
                     'seconds_left': sec_left,
                 })
+
+                if maker_on:
+                    run_maker_pilot_tick(
+                        maker_engine,
+                        report,
+                        now=time.time(),
+                        fair_signal=fair_value.edge_signal,
+                        up_book=up_side_book,
+                        down_book=dn_side_book,
+                        stake_usd=args.stake_usd,
+                        execute=args.execute,
+                        rtds_ready=bool(args.execute),
+                        bucket=current_bucket,
+                        slug=slug,
+                        seconds_left=sec_left,
+                    )
+                    time.sleep(args.poll_sec)
+                    continue
 
                 if not decision.allow:
                     report['attempts'].append({
@@ -943,7 +1116,11 @@ def main():
 
     if not opened:
         report['finished_at'] = ts_utc()
-        report['result'] = 'no_entry_timeout'
+        attach_maker_pilot_summary(report, maker_engine)
+        if maker_on:
+            report['result'] = 'maker_pilot_shadow_complete'
+        else:
+            report['result'] = 'no_entry_timeout'
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 

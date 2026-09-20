@@ -21,6 +21,8 @@
   - `scripts/btc5m_report.py`
 - Latest-run completion reporter:
   - `scripts/btc5m_latest_report.py`
+- W6 maker/post-only shadow helper:
+  - `scripts/btc_5m_maker_pilot.py` (unit tests: `scripts/test_btc_5m_maker_pilot.py`)
 - Optional docker control:
   - `scripts/btc5m_docker.sh`
 

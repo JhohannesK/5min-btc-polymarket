@@ -46,6 +46,27 @@ shared_rules:
       late_hold_ev_buffer_pp: 0.02
       late_min_ask_notional_usd: 30
       redeem_value: 1.0
+  maker_pilot:
+    # W6 post-only / GTD maker path. Shadow-first. Live posting is stubbed.
+    # enabled=false by default. When enabled, shadow=true simulates quotes vs
+    # the book and never sends maker orders. live_execute still requires the
+    # execute CLI flag and remains off; the live path is stubbed until RTDS
+    # and CLOB credentials are ready. Paper-window before any live pilot.
+    enabled: false
+    shadow: true
+    live_execute: false
+    order_type: GTD
+    post_only: true
+    gtd_ttl_sec: 15
+    cancel_on_fair_flip: true
+    cancel_spread_widen_abs: 0.03
+    tick_size: 0.01
+    quote_improve_ticks: 0
+    rebate_bps: 0.0
+    taker_fee_rate: 0.07
+    maker_fee_rate: 0.0
+    max_quotes_per_bucket: 4
+    paper_window_required: true
 
 profiles:
   conservative:
@@ -113,6 +134,19 @@ profiles:
       enabled: false
       stop_loss_pct_from_entry: 0.25
       note: "Legacy stop-loss disabled when hold_to_redeem is true. Exit based on hold-EV instead."
+    maker_pilot:
+      enabled: false
+      shadow: true
+      live_execute: false
+      order_type: GTD
+      post_only: true
+      gtd_ttl_sec: 15
+      cancel_on_fair_flip: true
+      cancel_spread_widen_abs: 0.03
+      tick_size: 0.01
+      quote_improve_ticks: 0
+      rebate_bps: 0.0
+      paper_window_required: true
 
   aggressive:
     description: "Higher frequency and higher risk mode. Uses TWAP fair value by default."
@@ -174,6 +208,19 @@ profiles:
       enabled: false
       stop_loss_pct_from_entry: 0.30
       note: "Legacy stop-loss disabled when hold_to_redeem is true. Exit based on hold-EV instead."
+    maker_pilot:
+      enabled: false
+      shadow: true
+      live_execute: false
+      order_type: GTD
+      post_only: true
+      gtd_ttl_sec: 12
+      cancel_on_fair_flip: true
+      cancel_spread_widen_abs: 0.03
+      tick_size: 0.01
+      quote_improve_ticks: 0
+      rebate_bps: 0.0
+      paper_window_required: true
 
 runner_mapping:
   script: "skills/btc-5m-live/scripts/test_btc_5m_session_exit_sl.py"
@@ -197,6 +244,7 @@ notes:
   - "W2: ~250ms / itode-style taker delay. Add 0.5-1.0c (vol-scaled, clamped) to required edge. Prefer GTD/post-only over FAK/FOK snipes. Dry-run remains default; do not pass --execute until paper-validated."
   - "W5: Size <= depth within N ticks of the touch. Cap with fractional Kelly x remaining daily loss budget. Do not add a second clip if edge decayed after the first fill attempt."
   - "Entry: Trade when book price differs from fair by more than costs (crypto taker fee 7% * p * (1-p) + half-spread + delay buffer). Prefer maker/GTD when practical."
+  - "W6 maker_pilot: shadow-first post-only/GTD quotes vs book. Default enabled=false, shadow=true, live_execute=false. Live path is stubbed (still needs execute flag). Cancel on TWAP fair flip or spread widen. Paper-window before any live pilot."
   - "Exit: Hold to redeem (EV = fair_p * $1) unless selling at bid yields higher EV after fees. No legacy % stops on mid prices."
   - "Risk: One ticket per 5m bucket. Hard daily loss limit in dollars. Kill switch at runtime/.kill with flatten or hold action."
   - "Uncertainty: re-validate W3/W4 paper-window thresholds (entry window, hard-skip last seconds, hold-EV buffer, depth, min_abs_fair_dev) and W1/W2/W5 spread/depth thresholds on a short paper window before locking prod numbers."
