@@ -2,6 +2,8 @@ version: 1
 name: btc_5m_impulse_momentum_profiles
 market: polymarket_btc_updown_5m
 
+# Legacy impulse/momentum notes. Unused by the default W3 TWAP path
+# (see notes: below). Kept for --legacy-threshold-mode comparison only.
 strategy_reference:
   style: momentum_follow_through_into_close
   entry_window_seconds_left_target: 120
@@ -246,6 +248,6 @@ notes:
   - "Entry: Trade when book price differs from fair by more than costs (crypto taker fee 7% * p * (1-p) + half-spread + delay buffer). Prefer maker/GTD when practical."
   - "W6 maker_pilot: shadow-first post-only/GTD quotes vs book. Default enabled=false, shadow=true, live_execute=false. Live path is stubbed (still needs execute flag). Cancel on TWAP fair flip or spread widen. Paper-window before any live pilot."
   - "Exit: Hold to redeem (EV = fair_p * $1) unless selling at bid yields higher EV after fees. No legacy % stops on mid prices."
-  - "Risk: One ticket per 5m bucket. Hard daily loss limit in dollars. Kill switch at runtime/.kill with flatten or hold action."
+  - "Risk: One ticket per 5m bucket. Hard daily loss limit in dollars. Kill switch at runtime/.kill stops this runner and records flatten/hold on the report; it does not cancel CLOB orders."
   - "Uncertainty: re-validate W3/W4 paper-window thresholds (entry window, hard-skip last seconds, hold-EV buffer, depth, min_abs_fair_dev) and W1/W2/W5 spread/depth thresholds on a short paper window before locking prod numbers."
   - "Legacy threshold mode: Pass --legacy-threshold-mode to use old threshold/side-strength logic (for debug/comparison only)."
