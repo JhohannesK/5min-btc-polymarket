@@ -28,10 +28,10 @@ Use this skill when the operator wants to execute a BTC 5m TWAP fair-value strat
 - Default is dry-run unless `--execute` is set. Do not enable `--execute` until W1-W5 paper numbers are re-validated.
 - W3 projected-final-TWAP fair; W4 entry window T-240 to T-45 (soft-skip open, hard-skip last ~20s unless polarized hold-EV exception).
 - TWAP entries go through win-more gates: mid-band taker ban / fee_pp, 250ms delay buffer + GTD/post-only, depth+Kelly sizing, no second clip on decay.
-- W6 maker_pilot is shadow-first and off by default (`enabled: false`, `shadow: true`, `live_execute: false`). Live maker posting is stubbed and still requires the execute flag; it does not unlock live trading.
+- W6 maker_pilot is shadow-first and off by default (`enabled: false`, `shadow: true`, `live_execute: false`). `--maker-pilot` forces shadow and **skips TWAP taker entry**. Live maker posting is stubbed and does not unlock `--execute`.
 - Use controlled stake sizing (`--stake-usd`, profile caps, then W5 depth/Kelly cap).
 - If both UP and DOWN satisfy threshold logic, choose the stronger side.
-- Keep stop-loss and timing guards enabled in profile config.
+- Keep W4 timing guards enabled. Profile `stop_loss.enabled` is false when `hold_to_redeem` is true; exit is hold-EV, not % stop-loss.
 
 ## One-shot real test
 From trading repo root:
@@ -69,10 +69,10 @@ Handlers:
 - completion summary utility: `scripts/btc5m_latest_report.py --mark`
 
 Output:
-- isolated skill runtime logs: `skills/btc-5m-live/runtime/btc5m_<profile>_<UTCSTAMP>.log`
+- isolated skill runtime logs: `runtime/btc5m_<profile>_<UTCSTAMP>.log`
 
 ## Notes
 - Canonical runner resolves current BTC 5m market slug (`btc-updown-5m-<bucket>`).
 - Real order placement is delegated to `pm_live_trade_runner.py` with `--force-side` and `--max-notional-usd`.
-- Keep BTC5m automation scoped to this skill contour (`btc5m_ctl.sh` + `skills/btc-5m-live/runtime`) to avoid cross-skill interference.
+- Keep BTC5m automation scoped to this skill contour (`btc5m_ctl.sh` + `./runtime`) to avoid cross-skill interference.
 - Keep all GitHub-facing docs and metadata in English.
