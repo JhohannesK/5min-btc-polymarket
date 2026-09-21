@@ -252,6 +252,20 @@ class TestW4EntryTiming(unittest.TestCase):
         self.assertFalse(d.allow)
         self.assertEqual(d.reason, "skip_hard_last_seconds_ask_above_hold_ev_buffer")
 
+    def test_late_exception_denied_when_net_edge_missing(self):
+        d = evaluate_entry_timing(
+            seconds_left=15.0,
+            **self._allow_kwargs(fair_p=0.90, ask=0.70, net_edge_bps=1.0),
+        )
+        self.assertFalse(d.allow)
+        self.assertEqual(d.reason, "skip_hard_last_seconds_no_edge")
+
+    def test_disabled_timing_allows_outside_window(self):
+        cfg = EntryTimingConfig(enabled=False)
+        d = evaluate_entry_timing(seconds_left=12.0, **self._allow_kwargs(cfg=cfg))
+        self.assertTrue(d.allow)
+        self.assertEqual(d.reason, "timing_disabled")
+
     def test_after_default_window_before_hard_skip(self):
         d = evaluate_entry_timing(seconds_left=30.0, **self._allow_kwargs())
         self.assertFalse(d.allow)

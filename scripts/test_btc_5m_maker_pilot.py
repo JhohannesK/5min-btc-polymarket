@@ -82,6 +82,13 @@ class PostOnlyPriceTests(unittest.TestCase):
         self.assertEqual(px, 0.42)
         self.assertLess(px, 0.45)
 
+    def test_should_refuse_to_cross_when_spread_is_one_tick_or_less(self):
+        px = post_only_buy_price(0.44, 0.45, tick_size=0.01, improve_ticks=5)
+        self.assertEqual(px, 0.44)
+        self.assertLess(px, 0.45)
+        self.assertIsNone(post_only_buy_price(0.00, 0.01, tick_size=0.01))
+        self.assertIsNone(post_only_buy_price(-0.01, 0.50, tick_size=0.01))
+
 
 class CancelOnFlipTests(unittest.TestCase):
     def test_should_cancel_when_twap_fair_flips_away_from_quote_side(self):
@@ -177,6 +184,26 @@ class LiveGateTests(unittest.TestCase):
         ok, reason = live_maker_allowed(cfg, execute=False, rtds_ready=True, creds_ready=True)
         self.assertFalse(ok)
         self.assertEqual(reason, "requires_execute_flag")
+
+    def test_should_block_live_when_pilot_disabled(self):
+        ok, reason = live_maker_allowed(MakerPilotConfig(), execute=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "maker_pilot_disabled")
+
+    def test_should_block_live_when_live_execute_flag_off(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=False, live_execute=False)
+        ok, reason = live_maker_allowed(cfg, execute=True, rtds_ready=True, creds_ready=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "live_execute_flag_off")
+
+    def test_should_block_live_when_rtds_or_creds_missing(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=False, live_execute=True)
+        ok, reason = live_maker_allowed(cfg, execute=True, rtds_ready=False, creds_ready=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "rtds_not_ready")
+        ok, reason = live_maker_allowed(cfg, execute=True, rtds_ready=True, creds_ready=False)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "creds_not_ready")
 
     def test_default_config_is_disabled_shadow(self):
         cfg = MakerPilotConfig()
@@ -294,6 +321,95 @@ class ShadowEngineLoggingTests(unittest.TestCase):
         self.assertEqual(cancel_ev[0]["reason"], "spread_widen")
         summary = summarize_maker_pilot(eng.events)
         self.assertEqual(summary["cancels_spread_widen"], 1)
+
+    def test_should_cancel_on_bucket_roll_then_open_next_bucket_quote(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True, max_quotes_per_bucket=4)
+        eng = MakerPilotEngine(cfg)
+        up = _book("UP", 0.44, 0.46, token_id="up-tok")
+        dn = _book("DOWN", 0.54, 0.56, token_id="dn-tok")
+        with redirect_stdout(io.StringIO()):
+            posted = eng.on_tick(
+                now=1_000.0,
+                fair_signal="up_favored",
+                up_book=up,
+                down_book=dn,
+                stake_usd=5.0,
+                bucket=1,
+            )
+            rolled = eng.on_tick(
+                now=1_001.0,
+                fair_signal="up_favored",
+                up_book=up,
+                down_book=dn,
+                stake_usd=5.0,
+                bucket=2,
+            )
+        self.assertEqual(posted[0]["event"], "shadow_post")
+        self.assertEqual(rolled[0]["event"], "would_cancel")
+        self.assertEqual(rolled[0]["reason"], "bucket_roll")
+        # Bucket roll currently resets the per-bucket counter and may re-quote
+        # on the same tick (closed_this_tick is only set in _manage_live_quote).
+        self.assertTrue(any(e.get("event") == "shadow_post" for e in rolled))
+        self.assertEqual(eng.active.side, "UP")
+        self.assertEqual(eng._bucket, 2)
+
+    def test_should_honor_max_quotes_per_bucket(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True, max_quotes_per_bucket=1)
+        eng = MakerPilotEngine(cfg)
+        up = _book("UP", 0.44, 0.46)
+        dn = _book("DOWN", 0.54, 0.56)
+        with redirect_stdout(io.StringIO()):
+            first = eng.on_tick(
+                now=1_000.0,
+                fair_signal="up_favored",
+                up_book=up,
+                down_book=dn,
+                stake_usd=5.0,
+                bucket=7,
+            )
+            after_cancel = eng.on_tick(
+                now=1_016.0,
+                fair_signal="up_favored",
+                up_book=up,
+                down_book=dn,
+                stake_usd=5.0,
+                bucket=7,
+            )
+            next_tick = eng.on_tick(
+                now=1_017.0,
+                fair_signal="up_favored",
+                up_book=up,
+                down_book=dn,
+                stake_usd=5.0,
+                bucket=7,
+            )
+        self.assertEqual(first[0]["event"], "shadow_post")
+        self.assertEqual(after_cancel[0]["event"], "would_cancel")
+        self.assertEqual(after_cancel[0]["reason"], "gtd_expired")
+        self.assertEqual(next_tick, [])
+        self.assertEqual(eng._quotes_this_bucket, 1)
+
+    def test_should_skip_post_when_no_post_only_price(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True)
+        eng = MakerPilotEngine(cfg)
+        with redirect_stdout(io.StringIO()):
+            out = eng.on_tick(
+                now=1.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", None, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+            )
+        self.assertEqual(out[0]["event"], "post_skip")
+        self.assertEqual(out[0]["reason"], "no_post_only_price")
+        self.assertIsNone(eng.active)
+
+    def test_should_not_cancel_on_fair_flip_when_rule_disabled(self):
+        quote = _quote(side="UP")
+        book = _book("UP", 0.44, 0.45)
+        cfg = MakerPilotConfig(enabled=True, cancel_on_fair_flip=False, cancel_spread_widen_abs=0.03)
+        d = evaluate_cancel_rules(quote, book, "down_favored", now=1_005.0, config=cfg)
+        self.assertFalse(d.cancel)
 
     def test_disabled_engine_should_not_post(self):
         eng = MakerPilotEngine(MakerPilotConfig(enabled=False))
