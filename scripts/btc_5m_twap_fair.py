@@ -204,7 +204,7 @@ def projected_final_twap_fair(
     move_bps = (projected / window_open_twap - 1.0) * 10000.0 if window_open_twap > 0 else 0.0
     if abs(move_bps) < 5:
         edge_signal = "neutral"
-    elif move_bps > 5:
+    elif move_bps >= 5:
         edge_signal = "up_favored"
     else:
         edge_signal = "down_favored"

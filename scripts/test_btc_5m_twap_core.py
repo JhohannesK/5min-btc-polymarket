@@ -140,14 +140,18 @@ class ProjectedFairEdgeCasesTests(unittest.TestCase):
         self.assertAlmostEqual(locked, 1.0)
         self.assertAlmostEqual(remaining, 0.0)
 
-    def test_should_be_neutral_inside_five_bps_and_favored_at_the_bound(self):
+    def test_should_be_neutral_inside_five_bps_and_favored_outside(self):
         open_px = 100_000.0
-        inside = projected_final_twap_fair(open_px, open_px * 1.0004, 240.0)
-        at_bound = projected_final_twap_fair(open_px, open_px * 1.0005, 240.0)
-        down = projected_final_twap_fair(open_px, open_px * 0.9994, 240.0)
+        # Float makes 100050 print as ~4.999999 bps, so use prints clearly
+        # inside vs past the abs(move_bps) < 5 band.
+        inside = projected_final_twap_fair(open_px, 100_040.0, 240.0)
+        up = projected_final_twap_fair(open_px, 100_060.0, 240.0)
+        down = projected_final_twap_fair(open_px, 99_940.0, 240.0)
         self.assertEqual(inside["edge_signal"], "neutral")
-        self.assertEqual(at_bound["edge_signal"], "up_favored")
+        self.assertEqual(up["edge_signal"], "up_favored")
         self.assertEqual(down["edge_signal"], "down_favored")
+        self.assertGreater(up["p_up"], 0.5)
+        self.assertLess(down["p_up"], 0.5)
 
 
 class RtdsTrackerTests(unittest.TestCase):

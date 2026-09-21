@@ -322,7 +322,7 @@ class ShadowEngineLoggingTests(unittest.TestCase):
         summary = summarize_maker_pilot(eng.events)
         self.assertEqual(summary["cancels_spread_widen"], 1)
 
-    def test_should_cancel_on_bucket_roll_and_not_requote_same_tick(self):
+    def test_should_cancel_on_bucket_roll_then_open_next_bucket_quote(self):
         cfg = MakerPilotConfig(enabled=True, shadow=True, max_quotes_per_bucket=4)
         eng = MakerPilotEngine(cfg)
         up = _book("UP", 0.44, 0.46, token_id="up-tok")
