@@ -20,6 +20,7 @@ from btc_5m_winmore_gates import (
     fee_pp,
     fractional_kelly_usd,
     is_midband,
+    parse_book_levels,
     select_entry,
     should_block_second_clip,
     taker_delay_buffer_pp,
@@ -275,6 +276,71 @@ class TestW5DepthKellySecondClip(unittest.TestCase):
         picked = select_entry(up, down)
         self.assertTrue(picked.allow)
         self.assertEqual(picked.side, "DOWN")
+
+    def test_select_entry_returns_closest_deny_when_both_blocked(self):
+        cfg = _cfg(midband_taker_policy="skip")
+        up = evaluate_side(
+            "UP", 0.72, 0.50, 0.48, [BookLevel(0.50, 200.0)], cfg, 5.0, 50.0, 3.5
+        )
+        down = evaluate_side(
+            "DOWN", 0.51, 0.70, 0.69, [BookLevel(0.70, 100.0)], cfg, 5.0, 50.0, 3.5
+        )
+        self.assertFalse(up.allow)
+        self.assertFalse(down.allow)
+        picked = select_entry(up, down)
+        self.assertFalse(picked.allow)
+        self.assertEqual(picked, up if up.net_edge_pp >= down.net_edge_pp else down)
+
+    def test_parse_book_levels_accepts_dicts_tuples_and_drops_junk(self):
+        levels = parse_book_levels(
+            [
+                {"price": "0.70", "size": "4"},
+                (0.71, 2.0),
+                BookLevel(0.72, 1.0),
+                {"price": 0.0, "size": 9},
+                "nope",
+            ]
+        )
+        self.assertEqual(len(levels), 3)
+        self.assertAlmostEqual(levels[0].price, 0.70)
+        self.assertAlmostEqual(levels[2].size, 1.0)
+
+    def test_cap_size_denies_empty_depth_kelly_zero_and_below_min_stake(self):
+        empty = depth_within_n_ticks([], 0.70, 3)
+        sized, shares, deny = cap_size_usd(5.0, 0.70, empty, kelly_cap_usd=50.0, min_stake_usd=1.0)
+        self.assertEqual(deny, "skip_no_depth_within_ticks")
+        self.assertEqual(sized, 0.0)
+        self.assertEqual(shares, 0.0)
+
+        depth = depth_within_n_ticks([BookLevel(0.70, 40.0)], 0.70, 3)
+        _, _, deny = cap_size_usd(5.0, 0.70, depth, kelly_cap_usd=0.0, min_stake_usd=1.0)
+        self.assertEqual(deny, "skip_kelly_cap_zero")
+        _, _, deny = cap_size_usd(5.0, 0.70, depth, kelly_cap_usd=0.40, min_stake_usd=1.0)
+        self.assertEqual(deny, "skip_size_below_min_stake")
+
+    def test_evaluate_skips_missing_ask_and_zero_loss_budget(self):
+        cfg = _cfg(midband_enabled=False, min_edge_pp=0.001, taker_delay_buffer_vol_scale=False)
+        no_ask = evaluate_side(
+            "UP", 0.80, None, 0.69, [BookLevel(0.70, 100.0)], cfg, 5.0, 50.0, 3.5
+        )
+        self.assertFalse(no_ask.allow)
+        self.assertEqual(no_ask.reason, "skip_no_ask")
+
+        zero_budget = evaluate_side(
+            "UP", 0.85, 0.70, 0.69, [BookLevel(0.70, 100.0)], cfg, 5.0, 0.0, 3.5
+        )
+        self.assertFalse(zero_budget.allow)
+        self.assertEqual(zero_budget.reason, "skip_kelly_cap_zero")
+
+    def test_depth_within_n_ticks_on_bid_side(self):
+        levels = [BookLevel(0.70, 10.0), BookLevel(0.69, 10.0), BookLevel(0.60, 999.0)]
+        slice_ = depth_within_n_ticks(levels, touch=0.70, n_ticks=1, tick_size=0.01, side="bid")
+        self.assertAlmostEqual(slice_.shares, 20.0)
+        self.assertGreater(slice_.depth_cost_pp, 0.0)
+
+    def test_fractional_kelly_zero_at_invalid_entry_price(self):
+        self.assertEqual(fractional_kelly_usd(0.80, 0.0, 0.25, 50.0), 0.0)
+        self.assertEqual(fractional_kelly_usd(0.80, 1.0, 0.25, 50.0), 0.0)
 
 
 class TestConfigAndDryRunDefault(unittest.TestCase):
