@@ -34,8 +34,9 @@
 
 ## Runtime artifacts
 - Primary runtime dir (skill-isolated):
-  - `skills/btc-5m-live/runtime`
+  - `./runtime` (resolved from this repo root; `btc5m_ctl.sh` uses `$SKILL_ROOT/runtime`)
 - BTC 5m run logs follow `btc5m_*` naming.
+- Kill switch file: `runtime/.kill` (see `runtime/.kill.example`). Stops the runner; does not flatten CLOB orders.
 
 ## Isolation guidance
 - Keep BTC 5m cron/checkers scoped to this skill naming (`btc5m-*`).

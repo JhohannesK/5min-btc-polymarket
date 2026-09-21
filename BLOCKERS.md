@@ -171,6 +171,9 @@ External runner provides:
 
 Any bugs in external runner are out of scope for this repo.
 
+### W6 maker_pilot does not unlock --execute
+`--maker-pilot` (or yaml `enabled: true`) is shadow-only. It skips TWAP taker entry. The live maker path always returns `live_maker_path_stubbed_until_rtds_and_creds_ready`. Clearing RTDS/CLOB blockers does not enable maker posts.
+
 ---
 
 ## Quick Start for Dry-Run (No Blockers)
