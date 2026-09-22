@@ -25,6 +25,7 @@ from btc_5m_maker_pilot import (
     SideBook,
     adverse_selection_usd,
     book_would_fill_buy,
+    default_maker_pilot_mapping,
     evaluate_cancel_rules,
     favored_side_from_signal,
     format_maker_pilot_report,
@@ -32,6 +33,7 @@ from btc_5m_maker_pilot import (
     post_only_buy_price,
     rebate_estimate_usd,
     summarize_maker_pilot,
+    taker_fee_usd,
 )
 
 
@@ -65,6 +67,12 @@ class FavoredSideTests(unittest.TestCase):
         self.assertEqual(favored_side_from_signal("down_favored"), "DOWN")
         self.assertIsNone(favored_side_from_signal("neutral"))
         self.assertIsNone(favored_side_from_signal("unavailable"))
+
+    def test_should_accept_short_aliases_and_ignore_blank(self):
+        self.assertEqual(favored_side_from_signal("up"), "UP")
+        self.assertEqual(favored_side_from_signal("DOWN"), "DOWN")
+        self.assertIsNone(favored_side_from_signal(""))
+        self.assertIsNone(favored_side_from_signal(None))  # type: ignore[arg-type]
 
 
 class PostOnlyPriceTests(unittest.TestCase):
@@ -133,6 +141,14 @@ class CancelOnSpreadWidenTests(unittest.TestCase):
         self.assertTrue(d.cancel)
         self.assertEqual(d.reason, "gtd_expired")
 
+    def test_should_ignore_cancel_rules_when_quote_is_already_closed(self):
+        quote = _quote(status="cancelled")
+        book = _book("UP", 0.10, 0.90)
+        cfg = MakerPilotConfig(enabled=True, cancel_spread_widen_abs=0.03)
+        d = evaluate_cancel_rules(quote, book, "down_favored", now=9_999.0, config=cfg)
+        self.assertFalse(d.cancel)
+        self.assertIsNone(d.reason)
+
 
 class WouldFillTests(unittest.TestCase):
     def test_should_fill_when_ask_crosses_resting_buy(self):
@@ -145,6 +161,12 @@ class WouldFillTests(unittest.TestCase):
         book = _book("UP", 0.44, 0.46)
         self.assertFalse(book_would_fill_buy(quote, book))
 
+    def test_should_not_fill_when_quote_is_not_live_or_ask_is_missing(self):
+        live = _quote(price=0.44)
+        dead = _quote(price=0.44, status="cancelled")
+        self.assertFalse(book_would_fill_buy(dead, _book("UP", 0.43, 0.44)))
+        self.assertFalse(book_would_fill_buy(live, _book("UP", 0.43, None)))
+
 
 class RebateAndAdverseTests(unittest.TestCase):
     def test_should_estimate_rebate_as_taker_fee_saved_when_makers_pay_zero(self):
@@ -152,9 +174,22 @@ class RebateAndAdverseTests(unittest.TestCase):
         self.assertAlmostEqual(saved, 1.75, places=6)
         self.assertAlmostEqual(rebate, 1.75, places=6)
 
+    def test_should_add_rebate_bps_and_subtract_maker_fee(self):
+        rebate, saved = rebate_estimate_usd(
+            100.0, 0.50, rebate_bps=10.0, maker_fee_rate=0.001
+        )
+        self.assertAlmostEqual(saved, taker_fee_usd(100.0, 0.50), places=8)
+        self.assertAlmostEqual(saved, 1.75, places=6)
+        # 10 bps of 50 USDC notional = 0.05; maker fee 0.1% of 50 = 0.05
+        self.assertAlmostEqual(rebate, 1.75 + 0.05 - 0.05, places=6)
+
     def test_should_treat_mid_drop_after_buy_quote_as_adverse(self):
         adv = adverse_selection_usd("UP", 10.0, mid_at_quote=0.50, mid_now=0.48)
         self.assertAlmostEqual(adv, 0.20, places=6)
+
+    def test_should_treat_down_token_mid_drop_as_adverse_too(self):
+        adv = adverse_selection_usd("DOWN", 10.0, mid_at_quote=0.60, mid_now=0.55)
+        self.assertAlmostEqual(adv, 0.50, places=6)
 
 
 class LiveGateTests(unittest.TestCase):
@@ -184,6 +219,14 @@ class LiveGateTests(unittest.TestCase):
         self.assertTrue(cfg.shadow)
         self.assertFalse(cfg.live_execute)
         self.assertEqual(cfg.effective_mode(), "disabled")
+
+    def test_should_report_live_requested_but_stubbed_when_all_live_flags_on(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=False, live_execute=True)
+        self.assertEqual(cfg.effective_mode(), "live_requested_but_stubbed")
+        public = cfg.as_public_dict()
+        self.assertEqual(public["live_path"], "stubbed")
+        self.assertEqual(public["mode"], "live_requested_but_stubbed")
+        self.assertEqual(default_maker_pilot_mapping()["enabled"], False)
 
 
 class ShadowEngineLoggingTests(unittest.TestCase):
@@ -366,6 +409,131 @@ class ShadowEngineLoggingTests(unittest.TestCase):
             "order_type",
         ):
             self.assertIn(key, payload)
+
+    def test_should_prefer_fill_over_cancel_when_ask_crosses_on_a_wide_book(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True, cancel_spread_widen_abs=0.03)
+        eng = MakerPilotEngine(cfg)
+        with redirect_stdout(io.StringIO()):
+            eng.on_tick(
+                now=1_000.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+                bucket=4,
+            )
+            crossed_and_wide = eng.on_tick(
+                now=1_001.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.30, 0.44),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+                bucket=4,
+            )
+        events = [e.get("event") for e in crossed_and_wide]
+        self.assertEqual(events, ["would_fill"])
+        self.assertFalse(any(e.get("event") == "would_cancel" for e in crossed_and_wide))
+        self.assertFalse(any(e.get("event") == "shadow_post" for e in crossed_and_wide))
+
+    def test_should_not_requote_on_the_same_tick_as_a_fill(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True, max_quotes_per_bucket=4)
+        eng = MakerPilotEngine(cfg)
+        with redirect_stdout(io.StringIO()):
+            eng.on_tick(
+                now=1_000.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+                bucket=8,
+            )
+            filled = eng.on_tick(
+                now=1_001.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.42, 0.44),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+                bucket=8,
+            )
+        self.assertEqual([e.get("event") for e in filled], ["would_fill"])
+        self.assertIsNotNone(eng.active)
+        self.assertEqual(eng.active.status, "would_fill")
+
+    def test_should_skip_post_when_signal_is_neutral_or_stake_is_zero(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True)
+        eng = MakerPilotEngine(cfg)
+        with redirect_stdout(io.StringIO()):
+            neutral = eng.on_tick(
+                now=1.0,
+                fair_signal="neutral",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+            )
+            zero = eng.on_tick(
+                now=2.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=0.0,
+            )
+        self.assertEqual(neutral, [])
+        self.assertEqual(zero, [])
+        self.assertIsNone(eng.active)
+
+    def test_should_not_gtd_expire_when_ttl_is_zero(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True, gtd_ttl_sec=0.0)
+        eng = MakerPilotEngine(cfg)
+        with redirect_stdout(io.StringIO()):
+            posted = eng.on_tick(
+                now=1_000.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+            )
+            later = eng.on_tick(
+                now=2_000.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+            )
+        self.assertEqual(posted[0]["event"], "shadow_post")
+        self.assertIsNone(posted[0]["gtd_expire_at"])
+        self.assertEqual(posted[0]["live_reason"], "shadow_mode")
+        self.assertEqual(later, [])
+        self.assertEqual(eng.active.status, "live")
+
+    def test_should_count_gtd_expiry_in_summary(self):
+        cfg = MakerPilotConfig(enabled=True, shadow=True, gtd_ttl_sec=15.0)
+        eng = MakerPilotEngine(cfg)
+        with redirect_stdout(io.StringIO()):
+            eng.on_tick(
+                now=1_000.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+            )
+            eng.on_tick(
+                now=1_016.0,
+                fair_signal="up_favored",
+                up_book=_book("UP", 0.44, 0.46),
+                down_book=_book("DOWN", 0.54, 0.56),
+                stake_usd=5.0,
+            )
+        summary = summarize_maker_pilot(eng.events, eng.quotes)
+        self.assertEqual(summary["cancels_gtd_expired"], 1)
+        self.assertEqual(summary["cancel_reasons"]["gtd_expired"], 1)
+
+    def test_side_book_clamps_inverted_spread_and_needs_both_quotes_for_mid(self):
+        inverted = _book("UP", 0.50, 0.40)
+        self.assertEqual(inverted.spread, 0.0)
+        self.assertAlmostEqual(inverted.mid, 0.45)
+        missing = SideBook(side="UP", best_bid=0.44)
+        self.assertIsNone(missing.spread)
+        self.assertIsNone(missing.mid)
 
 
 if __name__ == "__main__":

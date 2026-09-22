@@ -153,6 +153,15 @@ def p_up_from_projected(
     return (1.0 + math.erf(z_score / math.sqrt(2.0))) / 2.0
 
 
+def edge_signal_from_move_bps(move_bps: float) -> str:
+    """Map projected TWAP move to a side. Dead band is abs(move) < 5 bps."""
+    if abs(move_bps) < 5:
+        return "neutral"
+    if move_bps >= 5:
+        return "up_favored"
+    return "down_favored"
+
+
 def locked_level_from_path(
     path: list[TWAPSnapshot],
     now: float,
@@ -202,12 +211,7 @@ def projected_final_twap_fair(
     p_down = 1.0 - p_up
 
     move_bps = (projected / window_open_twap - 1.0) * 10000.0 if window_open_twap > 0 else 0.0
-    if abs(move_bps) < 5:
-        edge_signal = "neutral"
-    elif move_bps > 5:
-        edge_signal = "up_favored"
-    else:
-        edge_signal = "down_favored"
+    edge_signal = edge_signal_from_move_bps(move_bps)
 
     return {
         "p_up": p_up,
