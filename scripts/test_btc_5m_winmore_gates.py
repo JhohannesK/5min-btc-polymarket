@@ -12,14 +12,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from btc_5m_winmore_gates import (
     BookLevel,
+    DepthSlice,
     WinmoreConfig,
     cap_size_usd,
     choose_entry_order_type,
+    decision_log_fields,
     depth_within_n_ticks,
     evaluate_side,
     fee_pp,
     fractional_kelly_usd,
     is_midband,
+    required_min_edge_pp,
     select_entry,
     should_block_second_clip,
     taker_delay_buffer_pp,
@@ -276,6 +279,106 @@ class TestW5DepthKellySecondClip(unittest.TestCase):
         self.assertTrue(picked.allow)
         self.assertEqual(picked.side, "DOWN")
 
+    def test_select_entry_keeps_the_only_allowed_side(self):
+        cfg = _cfg(
+            midband_enabled=False,
+            min_edge_pp=0.001,
+            taker_delay_buffer_vol_scale=False,
+            taker_delay_buffer_pp=0.001,
+            kelly_fraction=0.5,
+        )
+        up = evaluate_side(
+            "UP", 0.80, 0.70, 0.69, [BookLevel(0.70, 100.0)], cfg, 5.0, 50.0, 3.5
+        )
+        down = evaluate_side(
+            "DOWN", 0.51, None, 0.49, [BookLevel(0.50, 100.0)], cfg, 5.0, 50.0, 3.5
+        )
+        self.assertTrue(up.allow, up.reason)
+        self.assertFalse(down.allow)
+        self.assertEqual(select_entry(up, down).side, "UP")
+
+    def test_cap_size_denies_invalid_inputs_and_clipped_size_below_min_stake(self):
+        depth = DepthSlice(
+            shares=5.0,
+            notional_usd=10.0,
+            vwap=0.50,
+            depth_cost_pp=0.0,
+            levels_used=1,
+        )
+        sized, shares, deny = cap_size_usd(0.0, 0.50, depth, 50.0, 1.0)
+        self.assertEqual(deny, "skip_invalid_size_inputs")
+        self.assertEqual(sized, 0.0)
+        self.assertEqual(shares, 0.0)
+        _, _, deny = cap_size_usd(5.0, 0.0, depth, 50.0, 1.0)
+        self.assertEqual(deny, "skip_invalid_size_inputs")
+
+        # sized clears min stake, then share-clip drops notional below it
+        _, _, deny = cap_size_usd(10.0, 0.50, depth, 50.0, 3.0)
+        self.assertEqual(deny, "skip_size_below_min_stake")
+
+    def test_evaluate_skips_non_positive_ask(self):
+        cfg = _cfg(midband_enabled=False)
+        d = evaluate_side(
+            "UP", 0.80, 0.0, 0.69, [BookLevel(0.70, 100.0)], cfg, 5.0, 50.0, 3.5
+        )
+        self.assertFalse(d.allow)
+        self.assertEqual(d.reason, "skip_no_ask")
+
+    def test_required_min_edge_adds_midband_raise_and_bans_skip_policy(self):
+        skip_cfg = _cfg(midband_taker_policy="skip", taker_delay_buffer_vol_scale=False)
+        req, deny = required_min_edge_pp(skip_cfg, 0.50, 3.5, "GTD")
+        self.assertEqual(deny, "skip_midband_taker_ban")
+        self.assertAlmostEqual(req, skip_cfg.min_edge_pp + skip_cfg.taker_delay_buffer_pp)
+
+        raise_cfg = _cfg(
+            midband_taker_policy="raise_min_edge",
+            midband_extra_min_edge_pp=0.02,
+            taker_delay_buffer_vol_scale=False,
+            taker_delay_buffer_pp=0.005,
+            min_edge_pp=0.005,
+        )
+        req, deny = required_min_edge_pp(raise_cfg, 0.50, 3.5, "GTD")
+        self.assertEqual(deny, "")
+        self.assertAlmostEqual(req, 0.030, places=6)
+        req, deny = required_min_edge_pp(raise_cfg, 0.70, 3.5, "GTD")
+        self.assertEqual(deny, "")
+        self.assertAlmostEqual(req, 0.010, places=6)
+
+        with self.assertRaises(ValueError):
+            required_min_edge_pp(
+                _cfg(midband_taker_policy="yolo"),  # type: ignore[arg-type]
+                0.50,
+                3.5,
+                "GTD",
+            )
+
+    def test_decision_log_fields_are_json_ready(self):
+        cfg = _cfg(
+            midband_enabled=False,
+            min_edge_pp=0.001,
+            taker_delay_buffer_vol_scale=False,
+            taker_delay_buffer_pp=0.001,
+            kelly_fraction=0.5,
+        )
+        d = evaluate_side(
+            "UP", 0.80, 0.70, 0.69, [BookLevel(0.70, 100.0)], cfg, 5.0, 50.0, 3.5
+        )
+        fields = decision_log_fields(d)
+        self.assertTrue(fields["allow"])
+        self.assertEqual(fields["side"], "UP")
+        self.assertEqual(fields["reason"], "enter")
+        for key in (
+            "entry_price",
+            "fair_p",
+            "net_edge_pp",
+            "required_min_edge_pp",
+            "size_usd",
+            "kelly_cap_usd",
+            "order_type",
+            "in_midband",
+        ):
+            self.assertIn(key, fields)
+
 
 class TestConfigAndDryRunDefault(unittest.TestCase):
     def test_yaml_mapping_roundtrip_policies(self):
@@ -331,6 +434,13 @@ class TestConfigAndDryRunDefault(unittest.TestCase):
         ap.add_argument("--execute", action="store_true")
         ns = ap.parse_args([])
         self.assertFalse(ns.execute)
+
+    def test_empty_mapping_uses_paper_defaults(self):
+        cfg = winmore_config_from_mapping(None)
+        self.assertTrue(cfg.midband_enabled)
+        self.assertEqual(cfg.midband_taker_policy, "skip")
+        self.assertEqual(cfg.taker_delay_ms, 250)
+        self.assertEqual(choose_entry_order_type(cfg), "GTD")
 
 
 if __name__ == "__main__":
