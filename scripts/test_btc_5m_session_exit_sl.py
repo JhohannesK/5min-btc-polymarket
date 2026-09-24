@@ -21,9 +21,7 @@ from btc_5m_twap_fair import (
     calculate_hold_ev
 )
 from btc_5m_entry_timing import (
-    TimingDecision,
     entry_timing_from_mapping,
-    evaluate_entry_timing,
 )
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
@@ -33,6 +31,21 @@ from btc_5m_maker_pilot import (
     SideBook,
     format_maker_pilot_report,
     summarize_maker_pilot,
+)
+from btc_5m_runner_parse import (
+    apply_maker_pilot_cli_override,
+    best_ask_notional as _best_ask_notional,
+    best_bid_ask as _best_bid_ask,
+    bucket_5m,
+    check_kill_switch,
+    estimate_session_fees,
+    market_side_prices,
+    min_spread as _min_spread,
+    parse_json_objects,
+    pick_timing_allowed_entry,
+    should_skip_legacy_late_entry,
+    spread_too_wide,
+    timing_checks_for_allowed_sides,
 )
 from btc_5m_winmore_gates import (
     EntryDecision,
@@ -53,31 +66,6 @@ def now_utc() -> dt.datetime:
 
 def ts_utc() -> str:
     return now_utc().isoformat().replace('+00:00', 'Z')
-
-
-def parse_json_objects(text: str) -> list[dict[str, Any]]:
-    out = []
-    cur = []
-    depth = 0
-    for ch in text:
-        if ch == '{':
-            depth += 1
-        if depth > 0:
-            cur.append(ch)
-        if ch == '}' and depth > 0:
-            depth -= 1
-            if depth == 0:
-                s = ''.join(cur)
-                cur = []
-                try:
-                    out.append(json.loads(s))
-                except Exception:
-                    pass
-    return out
-
-
-def bucket_5m(ts: int) -> int:
-    return ts - (ts % 300)
 
 
 def fetch_event(slug: str) -> Optional[dict[str, Any]]:
@@ -126,68 +114,6 @@ def resolve_active_current_5m_market() -> Optional[dict[str, Any]]:
     return mm
 
 
-def parse_json_field(v):
-    if isinstance(v, str):
-        try:
-            return json.loads(v)
-        except Exception:
-            return v
-    return v
-
-
-def market_side_prices(market: dict[str, Any]) -> tuple[float, float, str, str, str, str]:
-    outcomes = parse_json_field(market.get('outcomes')) or []
-    prices = parse_json_field(market.get('outcomePrices')) or []
-    token_ids = parse_json_field(market.get('clobTokenIds')) or []
-    if len(prices) < 2 or len(token_ids) < 2:
-        raise RuntimeError('missing outcomePrices/clobTokenIds')
-
-    up_i, down_i = 0, 1
-    labs = [str(x).lower() for x in outcomes[:2]] if isinstance(outcomes, list) else []
-    if len(labs) >= 2 and ('up' in labs[1] or 'yes' in labs[1]):
-        up_i, down_i = 1, 0
-
-    up_p = float(prices[up_i])
-    dn_p = float(prices[down_i])
-    up_t = str(token_ids[up_i])
-    dn_t = str(token_ids[down_i])
-    return up_p, dn_p, up_t, dn_t, str(market.get('slug') or market.get('_event_slug') or ''), str(market.get('endDate') or market.get('endDateIso') or '')
-
-
-def _best_bid_ask(book) -> tuple[Optional[float], Optional[float]]:
-    bids = getattr(book, 'bids', []) or []
-    asks = getattr(book, 'asks', []) or []
-    best_bid = None
-    best_ask = None
-    for b in bids:
-        p = float(getattr(b, 'price', 0) or 0)
-        if best_bid is None or p > best_bid:
-            best_bid = p
-    for a in asks:
-        p = float(getattr(a, 'price', 0) or 0)
-        if best_ask is None or p < best_ask:
-            best_ask = p
-    return best_bid, best_ask
-
-
-def _best_ask_notional(book) -> float:
-    """Top-of-book ask notional in USD (price * size). 0 if the book is empty."""
-    asks = getattr(book, 'asks', []) or []
-    best_p = None
-    best_sz = 0.0
-    for a in asks:
-        p = float(getattr(a, 'price', 0) or 0)
-        if p <= 0:
-            continue
-        sz = float(getattr(a, 'size', 0) or 0)
-        if best_p is None or p < best_p:
-            best_p = p
-            best_sz = sz
-    if best_p is None:
-        return 0.0
-    return best_p * best_sz
-
-
 def fetch_clob_books(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com'):
     """Fetch both CLOB books once (asks+bids+depth)."""
     pub = ClobClient(host=clob_base, chain_id=POLYGON)
@@ -226,13 +152,6 @@ def clob_side_books(
         side_book_from_clob('UP', up_token, up_raw),
         side_book_from_clob('DOWN', down_token, dn_raw),
     )
-
-
-def _min_spread(up_book: SideBook, dn_book: SideBook) -> Optional[float]:
-    spreads = [s for s in (up_book.spread, dn_book.spread) if s is not None]
-    if not spreads:
-        return None
-    return min(spreads)
 
 
 def run_maker_pilot_tick(
@@ -534,11 +453,10 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
     if args.hold_to_redeem is None:
         args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
-    args.maker_pilot_cfg = dict(prof.get('maker_pilot') or {})
-    if getattr(args, 'maker_pilot', False):
-        args.maker_pilot_cfg['enabled'] = True
-        args.maker_pilot_cfg['shadow'] = True
-        args.maker_pilot_cfg['live_execute'] = False
+    args.maker_pilot_cfg = apply_maker_pilot_cli_override(
+        dict(prof.get('maker_pilot') or {}),
+        getattr(args, 'maker_pilot', False),
+    )
     args.entry_timing_cfg = entry_timing_from_mapping(prof.get('entry_timing'))
     args.daily_max_loss_usd = float(prof.get('daily_max_loss_usd', 50.0))
     args.max_trades_per_day = int(prof.get('max_trades_per_day', 20))
@@ -552,31 +470,6 @@ def default_repo_path() -> str:
     if env_repo:
         return env_repo
     return str(Path(__file__).resolve().parents[3] / 'pm-hl-conservative-plus-repo')
-
-
-def check_kill_switch() -> Optional[str]:
-    """
-    Check for kill switch file.
-    
-    Returns:
-        Action if kill switch is active: 'flatten' or 'hold', None otherwise
-    """
-    kill_file = Path(__file__).parent.parent / 'runtime' / '.kill'
-    if not kill_file.exists():
-        return None
-    
-    try:
-        with open(kill_file, 'r') as f:
-            content = f.read()
-        
-        for line in content.split('\n'):
-            if line.startswith('action:'):
-                action = line.split(':', 1)[1].strip()
-                return action if action in ['flatten', 'hold'] else 'flatten'
-    except Exception:
-        pass
-    
-    return 'flatten'
 
 
 def main():
@@ -744,7 +637,12 @@ def main():
 
             # Legacy blunt late-entry skip. Fair-value path uses W4 timing instead.
             # Maker shadow still ticks so resting quotes cancel when the window is gone.
-            if sec_left < args.min_entry_seconds_left and (maker_on or not use_fair_value):
+            if should_skip_legacy_late_entry(
+                sec_left,
+                args.min_entry_seconds_left,
+                maker_on=maker_on,
+                use_fair_value=use_fair_value,
+            ):
                 if maker_on:
                     run_maker_pilot_tick(
                         maker_engine,
@@ -783,7 +681,7 @@ def main():
 
             # Enforce spread gate: skip if spread is too wide
             max_spread = 0.03
-            if min_spread is not None and min_spread > max_spread:
+            if spread_too_wide(min_spread, max_spread):
                 if maker_on:
                     wide_sig = 'unavailable'
                     if fair_calc is not None:
@@ -965,21 +863,16 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-                timed: list[tuple[EntryDecision, TimingDecision]] = []
-                for cand in (up_decision, dn_decision):
-                    if not cand.allow or not cand.side:
-                        continue
-                    fair_p_side = fair_value.p_up if cand.side == 'UP' else fair_value.p_down
-                    notional = up_ask_notional if cand.side == 'UP' else dn_ask_notional
-                    timing = evaluate_entry_timing(
-                        seconds_left=sec_left,
-                        fair_p=fair_p_side,
-                        ask=cand.entry_price,
-                        net_edge_bps=cand.net_edge_pp * 10000.0,
-                        min_edge_bps=cand.required_min_edge_pp * 10000.0,
-                        top_ask_notional_usd=notional,
-                        cfg=args.entry_timing_cfg,
-                    )
+                timing_checks = timing_checks_for_allowed_sides(
+                    [up_decision, dn_decision],
+                    seconds_left=sec_left,
+                    fair_p_up=fair_value.p_up,
+                    fair_p_down=fair_value.p_down,
+                    up_ask_notional=up_ask_notional,
+                    dn_ask_notional=dn_ask_notional,
+                    timing_cfg=args.entry_timing_cfg,
+                )
+                for cand, timing, notional in timing_checks:
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -992,10 +885,9 @@ def main():
                         'abs_fair_dev': timing.abs_fair_dev,
                         'top_ask_notional_usd': notional,
                     })
-                    if timing.allow:
-                        timed.append((cand, timing))
 
-                if not timed:
+                picked = pick_timing_allowed_entry(timing_checks)
+                if picked is None:
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -1005,7 +897,7 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-                decision, timing = sorted(timed, key=lambda x: x[0].net_edge_pp, reverse=True)[0]
+                decision, timing = picked
                 side = str(decision.side)
                 trigger_price = decision.entry_price
                 entry_stake = decision.size_usd
@@ -1381,21 +1273,13 @@ def main():
         # Estimate fees for informational purposes (Polymarket crypto: fee = shares * 0.07 * p * (1-p))
         entry_price = opened['entry_price']
         shares = opened['shares']
-        entry_fee_estimate = round(shares * 0.07 * entry_price * (1 - entry_price), 6)
-        
-        if closed['close_usdc'] > 0:
-            close_price = closed['close_usdc'] / shares if shares > 0 else 0
-            close_fee_estimate = round(shares * 0.07 * close_price * (1 - close_price), 6)
-        else:
-            close_fee_estimate = 0
-        
-        total_fee_estimate = entry_fee_estimate + close_fee_estimate
-        net_pnl_estimate = round(pnl - total_fee_estimate, 6)
+        fees = estimate_session_fees(shares, entry_price, closed['close_usdc'])
+        net_pnl_estimate = round(pnl - fees['total_fee_usdc'], 6)
         
         report['fee_estimates'] = {
-            'entry_fee_usdc': entry_fee_estimate,
-            'close_fee_usdc': close_fee_estimate,
-            'total_fee_usdc': total_fee_estimate,
+            'entry_fee_usdc': fees['entry_fee_usdc'],
+            'close_fee_usdc': fees['close_fee_usdc'],
+            'total_fee_usdc': fees['total_fee_usdc'],
             'note': 'Estimated using Polymarket crypto fee formula: shares * 0.07 * p * (1-p)',
         }
         report['net_pnl_estimate_usdc'] = net_pnl_estimate
