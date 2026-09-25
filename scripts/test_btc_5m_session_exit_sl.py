@@ -43,6 +43,25 @@ from btc_5m_winmore_gates import (
     select_entry,
     winmore_config_from_mapping,
 )
+from btc_5m_runner_exit import (
+    classify_close_result,
+    close_succeeded,
+    force_close_limit_price,
+    gtc_fallback_limit_price,
+    mark_held_to_redeem_on_time_exit,
+    session_pnl_bundle,
+    should_exit_on_hold_ev,
+    stop_loss_price,
+    stop_loss_triggered,
+)
+from btc_5m_runner_entry import (
+    clob_picked_spread,
+    extract_open_post,
+    open_fill_matched,
+    opened_from_fill,
+    pick_legacy_threshold_side,
+)
+from btc_5m_profiles import runtime_profile_from_yaml
 
 UTC = dt.timezone.utc
 
@@ -205,14 +224,7 @@ def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://c
     up_bid, up_ask = _best_bid_ask(up_book)
     dn_bid, dn_ask = _best_bid_ask(dn_book)
 
-    picked_spread = None
-    # Side picked later by max ask; keep a generic sanity spread estimate
-    if up_ask is not None and up_bid is not None:
-        picked_spread = max(0.0, up_ask - up_bid)
-    if dn_ask is not None and dn_bid is not None:
-        s = max(0.0, dn_ask - dn_bid)
-        picked_spread = s if picked_spread is None else min(picked_spread, s)
-
+    picked_spread = clob_picked_spread(up_bid, up_ask, dn_bid, dn_ask)
     return up_ask, dn_ask, picked_spread
 
 
@@ -471,36 +483,11 @@ def load_profiles_from_yaml() -> dict[str, dict[str, Any]]:
             config = yaml.safe_load(f)
         
         profiles = {}
+        shared_rules = config.get('shared_rules', {}) or {}
         for profile_name, profile_data in config.get('profiles', {}).items():
-            signal = profile_data.get('signal', {})
-            sizing = profile_data.get('sizing', {})
-            stop_loss = profile_data.get('stop_loss', {})
-            session_timing = config.get('shared_rules', {}).get('session_timing', {})
-            twap_fair = profile_data.get('twap_fair_value', {})
-            shared_mp = config.get('shared_rules', {}).get('maker_pilot', {}) or {}
-            profile_mp = profile_data.get('maker_pilot', {}) or {}
-            maker_pilot = {**shared_mp, **profile_mp}
-            entry_timing = dict(session_timing.get('entry_timing') or {})
-            entry_timing.update(twap_fair.get('entry_timing') or {})
-
-            profiles[profile_name] = {
-                'threshold': signal.get('threshold_price', 0.70),
-                'stake_usd': sizing.get('stake_usd', 5.0),
-                'stop_loss_pct': stop_loss.get('stop_loss_pct_from_entry', 0.25),
-                'exit_before_sec': session_timing.get('exit_before_sec', 20),
-                'min_entry_seconds_left': session_timing.get('min_entry_seconds_left', 60),
-                'entry_timeout_min': 60,
-                'poll_sec': 5.0,
-                'use_twap_fair_value': twap_fair.get('enabled', True),
-                'min_edge_bps': twap_fair.get('min_edge_bps', 5.0),
-                'btc_daily_vol_pct': twap_fair.get('btc_daily_vol_pct', 3.5),
-                'hold_to_redeem': twap_fair.get('hold_to_redeem', True),
-                'maker_pilot': maker_pilot,
-                'entry_timing': entry_timing,
-                'daily_max_loss_usd': float(sizing.get('daily_max_loss_usd', 50.0)),
-                'max_trades_per_day': int(sizing.get('max_trades_per_day', 20)),
-                'winmore': winmore_config_from_mapping(profile_data.get('winmore')),
-            }
+            if not isinstance(profile_data, dict):
+                continue
+            profiles[profile_name] = runtime_profile_from_yaml(profile_data, shared_rules)
         
         return profiles if profiles else fallback_profiles
     except Exception:
@@ -1034,13 +1021,8 @@ def main():
                 }
             else:
                 # Legacy threshold-only mode
-                candidates: list[tuple[str, float]] = []
-                if up_ask is not None and float(up_ask) >= args.threshold:
-                    candidates.append(('UP', float(up_ask)))
-                if dn_ask is not None and float(dn_ask) >= args.threshold:
-                    candidates.append(('DOWN', float(dn_ask)))
-
-                if not candidates:
+                picked = pick_legacy_threshold_side(up_ask, dn_ask, args.threshold)
+                if picked is None:
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -1053,7 +1035,7 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-                side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+                side, trigger_price = picked
                 entry_stake = args.stake_usd
                 entry_order_type = 'FAK'
 
@@ -1065,30 +1047,24 @@ def main():
                 args.execute,
                 order_type=entry_order_type,
             )
-            post = None
-            runner = None
-            for o in objs:
-                if isinstance(o, dict) and 'order_post_result' in o:
-                    runner = o
-                    post = o.get('order_post_result') or {}
-            if post and post.get('success') is True and str(post.get('status', '')).lower() == 'matched':
-                token_id = str(runner.get('token_id') or (up_t if side == 'UP' else dn_t))
-                shares = float(post.get('takingAmount') or 0)
-                cost = float(post.get('makingAmount') or 0)
-                entry_price = float(runner.get('entry_price') or trigger_price)
-                opened = {
-                    'opened_at': ts_utc(),
-                    'market_slug': slug,
-                    'market_end_iso': end_iso,
-                    'side': side,
-                    'token_id': token_id,
-                    'entry_price': entry_price,
-                    'shares': shares,
-                    'cost_usdc': cost,
-                    'open_order_id': post.get('orderID'),
-                    'open_tx': (post.get('transactionsHashes') or [None])[0],
-                    'bucket': current_bucket,
-                }
+            runner, post = extract_open_post(objs)
+            if open_fill_matched(post):
+                opened = opened_from_fill(
+                    runner or {},
+                    post or {},
+                    side=side,
+                    up_token=up_t,
+                    down_token=dn_t,
+                    trigger_price=trigger_price,
+                    slug=slug,
+                    end_iso=end_iso,
+                    bucket=current_bucket,
+                    opened_at=ts_utc(),
+                )
+                token_id = opened['token_id']
+                shares = opened['shares']
+                cost = opened['cost_usdc']
+                entry_price = opened['entry_price']
                 report['open_raw'] = out[-4000:]
                 
                 # Register ticket in state tracker
@@ -1145,7 +1121,7 @@ def main():
             if now >= (end_ts - args.exit_before_sec):
                 close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
                 # If exiting very close to settlement, mark as held to redeem
-                if args.exit_before_sec <= 20:
+                if mark_held_to_redeem_on_time_exit(args.exit_before_sec):
                     held_to_redeem = True
                 break
             
@@ -1186,7 +1162,7 @@ def main():
                 }
                 
                 # Exit only if sell EV > hold EV
-                if hold_ev['recommendation'] == 'sell':
+                if should_exit_on_hold_ev(hold_ev['recommendation']):
                     close_reason = 'sell_ev_exceeds_hold_ev'
                     break
             except Exception as e:
@@ -1196,7 +1172,7 @@ def main():
     else:
         # Legacy stop-loss mode
         report['exit_mode'] = 'legacy_stop_loss'
-        sl_price = opened['entry_price'] * (1.0 - args.stop_loss_pct)
+        sl_price = stop_loss_price(opened['entry_price'], args.stop_loss_pct)
         report['stop_loss_price'] = sl_price
         close_reason = None
         
@@ -1214,7 +1190,7 @@ def main():
             
             report['last_side_price'] = side_px
             report['last_check_at'] = ts_utc()
-            if side_px is not None and side_px <= sl_price:
+            if stop_loss_triggered(side_px, sl_price):
                 close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
                 break
             time.sleep(args.poll_sec)
@@ -1267,7 +1243,7 @@ def main():
                 bb = clob_best_bid(opened['token_id'])
             except Exception:
                 bb = None
-            limit_px = max(0.01, min(0.99, float((bb - 0.01) if bb is not None else px)))
+            limit_px = gtc_fallback_limit_price(bb, px)
             fallback_used = {'type': 'GTC_LIMIT', 'price': limit_px}
             out2, objs2 = run_close(
                 args.repo,
@@ -1316,7 +1292,7 @@ def main():
                     bb2 = clob_best_bid(opened['token_id'])
                 except Exception:
                     bb2 = None
-                force_px = max(0.01, min(0.99, float((bb2 - 0.02) if bb2 is not None else 0.01)))
+                force_px = force_close_limit_price(bb2)
                 force_close_used = {
                     'type': 'FORCE_GTC_LIMIT',
                     'price': force_px,
@@ -1355,7 +1331,7 @@ def main():
     closed = {
         'close_reason': close_reason,
         'closed_at': ts_utc(),
-        'close_success': bool(post.get('success') is True and (post_status == 'matched' or close_usdc > 0)),
+        'close_success': close_succeeded(post.get('success'), post_status, close_usdc),
         'close_status': post.get('status'),
         'close_order_id': post.get('orderID'),
         'close_tx': (post.get('transactionsHashes') or [None])[0],
@@ -1371,49 +1347,19 @@ def main():
     report['close_raw'] = out[-4000:]
     report['closed'] = closed
 
-    pnl = None
-    pnl_note = None
-    if closed['close_usdc']:
-        # Gross PnL (without fees)
-        pnl = round(closed['close_usdc'] - opened['cost_usdc'], 6)
-        pnl_note = "IMPORTANT: PnL excludes Polymarket taker fees (~2% on crypto markets at 70c entry). Actual net PnL is lower."
-        
-        # Estimate fees for informational purposes (Polymarket crypto: fee = shares * 0.07 * p * (1-p))
-        entry_price = opened['entry_price']
-        shares = opened['shares']
-        entry_fee_estimate = round(shares * 0.07 * entry_price * (1 - entry_price), 6)
-        
-        if closed['close_usdc'] > 0:
-            close_price = closed['close_usdc'] / shares if shares > 0 else 0
-            close_fee_estimate = round(shares * 0.07 * close_price * (1 - close_price), 6)
-        else:
-            close_fee_estimate = 0
-        
-        total_fee_estimate = entry_fee_estimate + close_fee_estimate
-        net_pnl_estimate = round(pnl - total_fee_estimate, 6)
-        
-        report['fee_estimates'] = {
-            'entry_fee_usdc': entry_fee_estimate,
-            'close_fee_usdc': close_fee_estimate,
-            'total_fee_usdc': total_fee_estimate,
-            'note': 'Estimated using Polymarket crypto fee formula: shares * 0.07 * p * (1-p)',
-        }
-        report['net_pnl_estimate_usdc'] = net_pnl_estimate
-    
+    pnl_bundle = session_pnl_bundle(opened, closed)
+    pnl = pnl_bundle['realized_cashflow_pnl_usdc']
     report['realized_cashflow_pnl_usdc'] = pnl
-    report['pnl_note'] = pnl_note
+    report['pnl_note'] = pnl_bundle['pnl_note']
+    if pnl_bundle['fee_estimates'] is not None:
+        report['fee_estimates'] = pnl_bundle['fee_estimates']
+        report['net_pnl_estimate_usdc'] = pnl_bundle['net_pnl_estimate_usdc']
     report['finished_at'] = ts_utc()
-    
-    # Report result accurately: done only if close succeeded, otherwise incomplete/failed
-    if closed['close_success']:
-        report['result'] = 'done'
-        close_status = 'closed'
-    elif closed['close_skipped']:
-        report['result'] = 'incomplete_close_skipped'
-        close_status = 'failed'
-    else:
-        report['result'] = 'incomplete_close_failed'
-        close_status = 'failed'
+
+    report['result'], close_status = classify_close_result(
+        closed['close_success'],
+        closed['close_skipped'],
+    )
     
     # Update state tracker with close
     pnl_for_tracker = pnl if pnl is not None else 0.0

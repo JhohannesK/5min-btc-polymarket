@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import glob
-import json
 import os
 import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from btc_5m_report_agg import parse_tail_json_text
 
 
 def default_runtime_dir() -> str:
@@ -12,13 +16,10 @@ def default_runtime_dir() -> str:
 
 def parse_tail_json(path: str):
     txt = pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
-    i = txt.rfind("\n{")
-    if i == -1 and txt.startswith("{"):
-        i = 0
-    if i == -1:
-        return None
-    blob = txt[i + 1 :] if txt[i : i + 1] == "\n" else txt[i:]
-    return json.loads(blob)
+    obj = parse_tail_json_text(txt)
+    if obj is None and txt.strip():
+        raise ValueError("no trailing json object")
+    return obj
 
 
 def main():
