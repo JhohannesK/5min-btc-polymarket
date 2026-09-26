@@ -20,11 +20,7 @@ from btc_5m_twap_fair import (
     FairValueCalculator,
     calculate_hold_ev
 )
-from btc_5m_entry_timing import (
-    TimingDecision,
-    entry_timing_from_mapping,
-    evaluate_entry_timing,
-)
+from btc_5m_entry_timing import TimingDecision, evaluate_entry_timing
 from log_twap_settle import log_twap_settle
 from btc_5m_state_tracker import StateTracker, TicketState
 from btc_5m_maker_pilot import (
@@ -42,6 +38,25 @@ from btc_5m_winmore_gates import (
     parse_book_levels,
     select_entry,
     winmore_config_from_mapping,
+)
+from btc_5m_runner_flow import (
+    abort_execute_without_rtds,
+    after_winmore_gate_action,
+    apply_close_env,
+    apply_open_env,
+    apply_profile_overrides,
+    build_close_cmd,
+    build_open_cmd,
+    classify_fak_close,
+    classify_gtc_close,
+    classify_gtc_poll,
+    clob_creds_ready,
+    maker_pilot_is_on,
+    poll_order_status,
+    record_failed_open_edge,
+    select_active_5m_market,
+    should_log_twap_settle,
+    use_fair_value_mode,
 )
 
 UTC = dt.timezone.utc
@@ -100,30 +115,7 @@ def resolve_active_current_5m_market() -> Optional[dict[str, Any]]:
     if not ev:
         return None
 
-    mkts = ev.get('markets') or []
-    if not mkts:
-        return None
-
-    m = mkts[0]
-    if m.get('closed') is True:
-        return None
-    if m.get('active') is False:
-        return None
-
-    end_iso = str(m.get('endDate') or m.get('endDateIso') or '')
-    try:
-        end_ts = dt.datetime.fromisoformat(end_iso.replace('Z', '+00:00')).timestamp()
-    except Exception:
-        return None
-
-    sec_left = end_ts - time.time()
-    if sec_left <= 5:
-        return None
-
-    mm = dict(m)
-    mm['_event_slug'] = slug
-    mm['_seconds_left'] = sec_left
-    return mm
+    return select_active_5m_market(ev, time.time(), slug)
 
 
 def parse_json_field(v):
@@ -298,7 +290,12 @@ def auth_clob_client(clob_base: str = 'https://clob.polymarket.com') -> Optional
         v1 = os.getenv('PM_API_KEY') or ''
         v2 = os.getenv('PM_API_SECRET') or ''
         v3 = os.getenv('PM_API_PASSPHRASE') or ''
-        if not key or not v1 or not v2 or not v3:
+        if not clob_creds_ready({
+            'PM_PRIVATE_KEY': key,
+            'PM_API_KEY': v1,
+            'PM_API_SECRET': v2,
+            'PM_API_PASSPHRASE': v3,
+        }):
             return None
         c = ClobClient(host=clob_base, chain_id=POLYGON, key=key, signature_type=sig, funder=funder)
         creds = {
@@ -310,28 +307,6 @@ def auth_clob_client(clob_base: str = 'https://clob.polymarket.com') -> Optional
         return c
     except Exception:
         return None
-
-
-def poll_order_status(client: Optional[ClobClient], order_id: str, wait_sec: float = 6.0, step_sec: float = 1.0) -> tuple[str, Optional[dict[str, Any]]]:
-    if client is None or not order_id:
-        return '', None
-    deadline = time.time() + max(0.0, float(wait_sec))
-    last = None
-    while time.time() <= deadline:
-        try:
-            last = client.get_order(order_id)
-            st = str((last or {}).get('status') or '').upper()
-            if st and st not in ('LIVE', 'OPEN'):
-                return st, last
-        except Exception:
-            pass
-        time.sleep(max(0.2, float(step_sec)))
-    try:
-        last = client.get_order(order_id)
-    except Exception:
-        pass
-    st = str((last or {}).get('status') or '').upper()
-    return st, last
 
 
 def cancel_token_orders(client: Optional[ClobClient], token_id: str) -> Optional[dict[str, Any]]:
@@ -351,24 +326,8 @@ def run_open(
     execute: bool,
     order_type: str = 'GTD',
 ) -> tuple[str, list[dict[str, Any]]]:
-    cmd = [
-        '.venv/bin/python',
-        'src/live/pm_live_trade_runner.py',
-        '--market-slug', slug,
-        '--force-side', side,
-        '--start-equity', '100',
-        '--risk-frac', str(stake / 100.0),
-        '--max-notional-usd', str(stake),
-    ]
-    if execute:
-        cmd.append('--execute')
-    env = os.environ.copy()
-    # Set reasonable defaults for safety guards instead of disabling them
-    # Only override if not already set in environment
-    env.setdefault('PM_MAX_SPREAD', '0.05')
-    env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '10')
-    # W2: honor prefer_post_only. Do not leave a sticky FAK env default in place.
-    env['PM_ORDER_TYPE'] = str(order_type or 'GTD').upper()
+    cmd = build_open_cmd(slug, side, stake, execute, order_type=order_type)
+    env = apply_open_env(os.environ.copy(), order_type)
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, env=env)
     out = (p.stdout or '') + '\n' + (p.stderr or '')
     return out, parse_json_objects(out)
@@ -383,19 +342,8 @@ def run_close(
     close_order_type: str = 'FAK',
     close_limit_price: float | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    cmd = [
-        '.venv/bin/python',
-        'src/live/pm_live_trade_runner.py',
-        '--market-slug', slug,
-        '--close-token-id', token_id,
-        '--close-shares', f'{shares:.8f}',
-    ]
-    if close_limit_price is not None and close_limit_price > 0:
-        cmd += ['--close-limit-price', f'{close_limit_price:.6f}']
-    if execute:
-        cmd.append('--execute')
-    env = os.environ.copy()
-    env['PM_CLOSE_ORDER_TYPE'] = str(close_order_type or 'FAK').upper()
+    cmd = build_close_cmd(slug, token_id, shares, execute, close_limit_price=close_limit_price)
+    env = apply_close_env(os.environ.copy(), close_order_type)
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, env=env)
     out = (p.stdout or '') + '\n' + (p.stderr or '')
     return out, parse_json_objects(out)
@@ -511,40 +459,7 @@ PROFILES = load_profiles_from_yaml()
 
 
 def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
-    prof = PROFILES.get(args.profile or 'conservative', PROFILES['conservative'])
-    if args.threshold is None:
-        args.threshold = float(prof['threshold'])
-    if args.stake_usd is None:
-        args.stake_usd = float(prof['stake_usd'])
-    if args.stop_loss_pct is None:
-        args.stop_loss_pct = float(prof['stop_loss_pct'])
-    if args.exit_before_sec is None:
-        args.exit_before_sec = int(prof['exit_before_sec'])
-    if args.min_entry_seconds_left is None:
-        args.min_entry_seconds_left = int(prof['min_entry_seconds_left'])
-    if args.entry_timeout_min is None:
-        args.entry_timeout_min = int(prof['entry_timeout_min'])
-    if args.poll_sec is None:
-        args.poll_sec = float(prof['poll_sec'])
-    if args.use_twap_fair_value is None:
-        args.use_twap_fair_value = bool(prof.get('use_twap_fair_value', True))
-    if args.min_edge_bps is None:
-        args.min_edge_bps = float(prof.get('min_edge_bps', 5.0))
-    if args.btc_daily_vol_pct is None:
-        args.btc_daily_vol_pct = float(prof.get('btc_daily_vol_pct', 3.5))
-    if args.hold_to_redeem is None:
-        args.hold_to_redeem = bool(prof.get('hold_to_redeem', True))
-    args.maker_pilot_cfg = dict(prof.get('maker_pilot') or {})
-    if getattr(args, 'maker_pilot', False):
-        args.maker_pilot_cfg['enabled'] = True
-        args.maker_pilot_cfg['shadow'] = True
-        args.maker_pilot_cfg['live_execute'] = False
-    args.entry_timing_cfg = entry_timing_from_mapping(prof.get('entry_timing'))
-    args.daily_max_loss_usd = float(prof.get('daily_max_loss_usd', 50.0))
-    args.max_trades_per_day = int(prof.get('max_trades_per_day', 20))
-    wm = prof.get('winmore')
-    args.winmore = wm if isinstance(wm, WinmoreConfig) else winmore_config_from_mapping(wm)
-    return args
+    return apply_profile_overrides(args, PROFILES)
 
 
 def default_repo_path() -> str:
@@ -606,7 +521,7 @@ def main():
     args = apply_profile(ap.parse_args())
 
     # Initialize TWAP tracker and fair value calculator
-    use_fair_value = args.use_twap_fair_value and not args.legacy_threshold_mode
+    use_fair_value = use_fair_value_mode(args.use_twap_fair_value, args.legacy_threshold_mode)
     if use_fair_value:
         # Allow fallback for dry-run; RTDS required for --execute
         twap_tracker = ChainlinkTWAPTracker()
@@ -625,7 +540,7 @@ def main():
 
     mp_cfg = MakerPilotConfig.from_mapping(getattr(args, 'maker_pilot_cfg', None))
     maker_engine = MakerPilotEngine(mp_cfg)
-    maker_on = mp_cfg.enabled and use_fair_value
+    maker_on = maker_pilot_is_on(mp_cfg.enabled, use_fair_value)
 
     report: dict[str, Any] = {
         'started_at': ts_utc(),
@@ -828,11 +743,14 @@ def main():
             if use_fair_value and fair_calc is not None:
                 # Check RTDS requirement for --execute mode
                 if args.execute and twap_tracker:
+                    rtds_ok = True
                     try:
                         # Force RTDS for live trading
                         test_snapshot = twap_tracker.get_current_twap(allow_fallback=False)
                     except RuntimeError as e:
+                        rtds_ok = False
                         report['rtds_check_failed'] = str(e)
+                    if abort_execute_without_rtds(args.execute, rtds_ok):
                         report['result'] = 'rtds_required_for_execute'
                         report['finished_at'] = ts_utc()
                         attach_maker_pilot_summary(report, maker_engine)
@@ -933,7 +851,8 @@ def main():
                     'seconds_left': sec_left,
                 })
 
-                if maker_on:
+                gate_action = after_winmore_gate_action(maker_on, decision.allow)
+                if gate_action == 'maker_tick_continue':
                     run_maker_pilot_tick(
                         maker_engine,
                         report,
@@ -951,7 +870,7 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-                if not decision.allow:
+                if gate_action == 'deny':
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -1108,8 +1027,7 @@ def main():
                 break
             else:
                 report['last_open_try'] = out[-2000:]
-                if twap_entry_net_edge is not None:
-                    fill_attempts[current_bucket] = twap_entry_net_edge
+                record_failed_open_edge(fill_attempts, current_bucket, twap_entry_net_edge)
         except Exception as e:
             report['attempts'].append({'ts': ts_utc(), 'status': 'error', 'error': str(e)})
         time.sleep(args.poll_sec)
@@ -1134,11 +1052,11 @@ def main():
         end_ts = time.time() + 300
 
     # Exit monitoring: hold-to-redeem EV or legacy stop-loss
+    held_to_redeem = False
     if args.hold_to_redeem and use_fair_value and fair_calc is not None:
         # Hold-to-redeem mode: only exit if selling is better EV than holding
         report['exit_mode'] = 'hold_to_redeem_ev'
         close_reason = None
-        held_to_redeem = False
         
         while True:
             now = time.time()
@@ -1246,17 +1164,17 @@ def main():
             'status': status,
             'close_skipped': skipped,
         })
-        if post.get('success') is True and status == 'matched':
+        fak_action = classify_fak_close(post, close_obj, out)
+        if fak_action == 'done':
             break
 
         # common transient path right after open: token balance not yet visible
-        if skipped == 'zero_effective_shares':
+        if fak_action == 'retry_zero_shares':
             time.sleep(float(args.close_retry_delay_sec))
             continue
 
         # fallback: if FAK has no instant match, try a GTC limit close near current side price
-        txt = ((out or '') + '\n' + json.dumps(close_obj, ensure_ascii=False)).lower()
-        if 'no orders found to match with fak order' in txt:
+        if fak_action == 'fallback_gtc':
             px = get_side_price_from_slug(opened['market_slug'], opened['side'])
             if px is None:
                 px = report.get('last_side_price')
@@ -1291,11 +1209,12 @@ def main():
             })
             close_obj = close_obj2
             out = out2
-            if post2.get('success') is True and status2 == 'matched':
+            gtc_action = classify_gtc_close(post2)
+            if gtc_action == 'done':
                 break
 
             # If GTC is accepted but still live, force-close flow: poll status, cancel, repost aggressive.
-            if post2.get('success') is True and status2 == 'live':
+            if gtc_action == 'poll_then_force':
                 oid2 = str(post2.get('orderID') or '')
                 st_upd, ord_upd = poll_order_status(client, oid2, wait_sec=min(8.0, max(2.0, float(args.close_retry_delay_sec) * 2)), step_sec=1.0)
                 close_debug.append({
@@ -1305,7 +1224,7 @@ def main():
                     'status': st_upd.lower() if st_upd else '',
                     'order_id': oid2,
                 })
-                if st_upd == 'MATCHED':
+                if classify_gtc_poll(st_upd) == 'done':
                     post2['status'] = 'matched'
                     close_obj['order_post_result'] = post2
                     break
@@ -1420,20 +1339,21 @@ def main():
     state_tracker.close_ticket(opened['bucket'], pnl_for_tracker, close_status)
     
     # Log TWAP settlement if position was held to redeem
+    window_open_twap = None
     if args.hold_to_redeem and use_fair_value and fair_calc is not None:
         window_open_twap = fair_calc.get_window_open_twap(opened['market_slug'])
-        if window_open_twap is not None and held_to_redeem:
-            try:
-                allow_fallback = not args.execute
-                settle_result = log_twap_settle(
-                    opened['market_slug'],
-                    window_open_twap,
-                    opened['side'],
-                    allow_fallback=allow_fallback
-                )
-                report['twap_settlement'] = settle_result
-            except Exception as e:
-                report['twap_settlement_error'] = str(e)
+    if should_log_twap_settle(args.hold_to_redeem, use_fair_value, held_to_redeem, window_open_twap):
+        try:
+            allow_fallback = not args.execute
+            settle_result = log_twap_settle(
+                opened['market_slug'],
+                window_open_twap,
+                opened['side'],
+                allow_fallback=allow_fallback
+            )
+            report['twap_settlement'] = settle_result
+        except Exception as e:
+            report['twap_settlement_error'] = str(e)
     
     # Daily summary at end
     report['daily_summary_end'] = state_tracker.get_daily_summary()
