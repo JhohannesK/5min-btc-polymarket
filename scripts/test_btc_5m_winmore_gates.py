@@ -258,6 +258,40 @@ class TestW5DepthKellySecondClip(unittest.TestCase):
         self.assertFalse(second.allow)
         self.assertEqual(second.reason, "skip_second_clip_edge_decayed")
 
+    def test_evaluate_side_denies_missing_or_zero_ask(self):
+        cfg = _cfg(midband_enabled=False)
+        for ask in (None, 0.0, -0.1):
+            d = evaluate_side(
+                side="UP",
+                fair_p=0.80,
+                ask=ask,
+                bid=0.69,
+                ask_levels=[BookLevel(0.70, 100.0)],
+                cfg=cfg,
+                stake_usd=5.0,
+                remaining_loss_budget_usd=50.0,
+                btc_daily_vol_pct=3.5,
+            )
+            self.assertFalse(d.allow, ask)
+            self.assertEqual(d.reason, "skip_no_ask")
+
+    def test_depth_walks_bids_within_n_ticks(self):
+        levels = [
+            BookLevel(0.70, 10.0),
+            BookLevel(0.69, 10.0),
+            BookLevel(0.68, 10.0),
+            BookLevel(0.67, 10.0),
+            BookLevel(0.60, 999.0),
+        ]
+        slice_ = depth_within_n_ticks(
+            levels, touch=0.70, n_ticks=3, tick_size=0.01, side="bid"
+        )
+        self.assertAlmostEqual(slice_.shares, 40.0)
+        self.assertEqual(slice_.levels_used, 4)
+        self.assertAlmostEqual(slice_.notional_usd, 10 * (0.70 + 0.69 + 0.68 + 0.67))
+        self.assertAlmostEqual(slice_.depth_cost_pp, 0.70 - slice_.vwap)
+        self.assertGreater(slice_.depth_cost_pp, 0.0)
+
     def test_select_entry_picks_higher_net_edge(self):
         cfg = _cfg(
             midband_enabled=False,
