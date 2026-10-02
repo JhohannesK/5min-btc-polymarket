@@ -257,9 +257,28 @@ class TestW4EntryTiming(unittest.TestCase):
         self.assertFalse(d.allow)
         self.assertEqual(d.reason, "skip_past_default_window")
 
+    def test_disabled_timing_allows_soft_open(self):
+        d = evaluate_entry_timing(
+            seconds_left=290.0,
+            **self._allow_kwargs(cfg=EntryTimingConfig(enabled=False)),
+        )
+        self.assertTrue(d.allow)
+        self.assertEqual(d.reason, "timing_disabled")
+        self.assertEqual(d.zone, "soft_open")
+
+    def test_hard_last_polarized_denied_when_edge_unclear(self):
+        d = evaluate_entry_timing(
+            seconds_left=15.0,
+            **self._allow_kwargs(fair_p=0.90, ask=0.70, net_edge_bps=1.0, min_edge_bps=5.0),
+        )
+        self.assertFalse(d.allow)
+        self.assertEqual(d.zone, "hard_last")
+        self.assertEqual(d.reason, "skip_hard_last_seconds_no_edge")
+
     def test_yaml_mapping_roundtrip(self):
         cfg = entry_timing_from_mapping(
             {
+                "enabled": False,
                 "window_max_seconds_left": 240,
                 "window_min_seconds_left": 45,
                 "soft_skip_open_sec": 20,
@@ -267,6 +286,7 @@ class TestW4EntryTiming(unittest.TestCase):
                 "late_hold_ev_buffer_pp": 0.015,
             }
         )
+        self.assertFalse(cfg.enabled)
         self.assertEqual(cfg.window_max_seconds_left, 240.0)
         self.assertEqual(cfg.window_min_seconds_left, 45.0)
         self.assertEqual(cfg.hard_skip_last_sec, 18.0)
