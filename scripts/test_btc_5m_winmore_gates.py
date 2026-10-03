@@ -20,6 +20,7 @@ from btc_5m_winmore_gates import (
     fee_pp,
     fractional_kelly_usd,
     is_midband,
+    required_min_edge_pp,
     select_entry,
     should_block_second_clip,
     taker_delay_buffer_pp,
@@ -67,6 +68,43 @@ class TestW1FeeAwareMidband(unittest.TestCase):
         self.assertFalse(d.allow)
         self.assertEqual(d.reason, "skip_midband_taker_ban")
         self.assertTrue(d.in_midband)
+
+    def test_midband_disabled_should_not_ban_a_50c_take(self):
+        cfg = _cfg(
+            midband_enabled=False,
+            midband_taker_policy="skip",
+            prefer_post_only=True,
+            min_edge_pp=0.005,
+            taker_delay_buffer_vol_scale=False,
+            taker_delay_buffer_pp=0.005,
+            kelly_fraction=0.5,
+        )
+        required, deny = required_min_edge_pp(cfg, 0.50, 3.5, "GTD")
+        self.assertEqual(deny, "")
+        self.assertAlmostEqual(required, 0.010, places=8)
+
+        d = evaluate_side(
+            side="UP",
+            fair_p=0.72,
+            ask=0.50,
+            bid=0.48,
+            ask_levels=[BookLevel(0.50, 200.0)],
+            cfg=cfg,
+            stake_usd=5.0,
+            remaining_loss_budget_usd=50.0,
+            btc_daily_vol_pct=3.5,
+        )
+        self.assertTrue(d.allow, d.reason)
+        self.assertFalse(d.in_midband)
+        self.assertEqual(d.reason, "enter")
+
+    def test_yaml_can_disable_midband_skip(self):
+        cfg = winmore_config_from_mapping(
+            {"midband": {"enabled": False, "taker_policy": "skip"}}
+        )
+        self.assertFalse(cfg.midband_enabled)
+        _, deny = required_min_edge_pp(cfg, 0.50, 3.5, "GTD")
+        self.assertEqual(deny, "")
 
     def test_midband_raise_requires_higher_net_edge(self):
         cfg = _cfg(
