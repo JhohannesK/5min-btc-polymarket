@@ -224,6 +224,8 @@ profiles:
       rebate_bps: 0.0
       paper_window_required: true
 
+# OpenClaw layout path. This clone's runner is scripts/test_btc_5m_session_exit_sl.py
+# (see example_*_now). The runner does not read this mapping at runtime.
 runner_mapping:
   script: "skills/btc-5m-live/scripts/test_btc_5m_session_exit_sl.py"
   direct_flags_now_supported:

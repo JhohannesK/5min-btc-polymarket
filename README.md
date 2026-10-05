@@ -153,6 +153,18 @@ grep 'MAKER_PILOT' runtime/btc5m_*.log
 
 Events: `shadow_post`, `would_fill`, `would_cancel`, `post_skip`. All JSON after `[MAKER_PILOT]`.
 
+## Legacy watch script (do not use for TWAP ops)
+
+`scripts/watch_btc_5m_threshold_and_enter.sh` is **not** the canonical TWAP path. It loops `run_btc_5m_threshold_test.py` with **`--execute` hardcoded**, default `--threshold 0.75`, `--stake-usd 4`, and writes logs to `$BTC5M_REPO/runtime/btc_5m_threshold_watch.log` (the **external** Polymarket runner repo, not `./runtime`).
+
+```bash
+# args: THRESHOLD STAKE SLEEP_SEC MAX_MIN
+# default: 0.75 4 20 180 — always --execute
+scripts/watch_btc_5m_threshold_and_enter.sh
+```
+
+Use `btc5m_ctl.sh` + `scripts/test_btc_5m_session_exit_sl.py` instead. `config/btc_5m_profiles.yaml` `runner_mapping.script` still uses the OpenClaw path `skills/btc-5m-live/scripts/...`; this clone's runner is `scripts/test_btc_5m_session_exit_sl.py`.
+
 ## Risk Controls Template
 Suggested baseline controls (adapt to your risk profile):
 

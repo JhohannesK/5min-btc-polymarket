@@ -15,12 +15,14 @@
   - `scripts/run_btc_5m_threshold_test.py`
 - Chat/start helper:
   - `scripts/btc5m_hot.sh`
-- Watch helper:
-  - `scripts/watch_btc_5m_threshold_and_enter.sh`
+- Watch helper (**legacy, do not use**):
+  - `scripts/watch_btc_5m_threshold_and_enter.sh` — loops the deprecated threshold wrapper with `--execute` hardcoded; logs to `$BTC5M_REPO/runtime/`, not `./runtime`
 - PnL/report utility:
-  - `scripts/btc5m_report.py`
+  - `scripts/btc5m_report.py` (JSON tails only; does **not** parse `[MAKER_PILOT]` lines)
 - Latest-run completion reporter:
   - `scripts/btc5m_latest_report.py`
+- Settle log helper (wired from the canonical runner after a fill):
+  - `scripts/log_twap_settle.py`
 - W6 maker/post-only shadow helper:
   - `scripts/btc_5m_maker_pilot.py` (unit tests: `scripts/test_btc_5m_maker_pilot.py`)
 - Optional docker control:
