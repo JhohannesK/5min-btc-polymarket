@@ -214,7 +214,7 @@ $ python3 scripts/verify_twap_fair_dryrun.py
 ### Live Verification (with RTDS)
 ```bash
 # Set RTDS credentials
-export RTDS_API_KEY="your-key"
+export CHAINLINK_RTDS_API_KEY="your-key"
 
 # Run with RTDS endpoint
 $ python3 scripts/test_btc_5m_session_exit_sl.py \
