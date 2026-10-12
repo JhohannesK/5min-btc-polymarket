@@ -27,7 +27,8 @@ Usage:
   btc5m_ctl.sh logs
 
 Notes:
-- Runs in isolated skill runtime: skills/btc-5m-live/runtime
+- Runs in isolated skill runtime: ./runtime (this repo)
+- Does not pass --maker-pilot; W6 shadow is runner-CLI or yaml only
 - Uses auth/env from pm-hl-conservative-plus-repo/.env
 - Defaults to dry-run mode; pass --execute for live trading
 EOF

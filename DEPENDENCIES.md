@@ -69,12 +69,10 @@ Required environment variables (set in external repo `.env` or environment):
 - Created automatically by `StateTracker`
 
 ### Kill Switch
-- Location: `runtime/.kill`
-- Purpose: Emergency stop for trading
-- Actions:
-  - `flatten`: Cancel orders and close all positions
-  - `hold`: Cancel orders and hold positions to settlement
-- Delete file to re-enable trading
+- Location: `runtime/.kill` (copy from `runtime/.kill.example`)
+- Purpose: Emergency stop for **this skill runner**
+- Behavior: `check_kill_switch()` sees the file, records `action: flatten` or `action: hold` on the JSON report (`result: kill_switch_<action>`), and **exits the poll loop**. It does **not** cancel CLOB orders or flatten/hold positions. Unknown `action` values fall back to `flatten`.
+- Delete the file to re-enable the next run.
 
 ## Verification Without Live Credentials
 
