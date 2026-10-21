@@ -43,6 +43,14 @@ from btc_5m_winmore_gates import (
     select_entry,
     winmore_config_from_mapping,
 )
+from btc_5m_legacy_gates import (
+    is_runner_open_matched,
+    pick_legacy_threshold_side,
+    shares_from_open_post,
+    should_exit_for_hold_ev,
+    stop_loss_hit,
+    stop_loss_trigger_price,
+)
 
 UTC = dt.timezone.utc
 
@@ -1034,13 +1042,8 @@ def main():
                 }
             else:
                 # Legacy threshold-only mode
-                candidates: list[tuple[str, float]] = []
-                if up_ask is not None and float(up_ask) >= args.threshold:
-                    candidates.append(('UP', float(up_ask)))
-                if dn_ask is not None and float(dn_ask) >= args.threshold:
-                    candidates.append(('DOWN', float(dn_ask)))
-
-                if not candidates:
+                side_pick = pick_legacy_threshold_side(up_ask, dn_ask, args.threshold)
+                if not side_pick:
                     report['attempts'].append({
                         'ts': ts_utc(),
                         'slug': slug,
@@ -1053,7 +1056,7 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-                side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+                side, trigger_price = side_pick
                 entry_stake = args.stake_usd
                 entry_order_type = 'FAK'
 
@@ -1071,9 +1074,9 @@ def main():
                 if isinstance(o, dict) and 'order_post_result' in o:
                     runner = o
                     post = o.get('order_post_result') or {}
-            if post and post.get('success') is True and str(post.get('status', '')).lower() == 'matched':
+            if is_runner_open_matched(post):
                 token_id = str(runner.get('token_id') or (up_t if side == 'UP' else dn_t))
-                shares = float(post.get('takingAmount') or 0)
+                shares = shares_from_open_post(post)
                 cost = float(post.get('makingAmount') or 0)
                 entry_price = float(runner.get('entry_price') or trigger_price)
                 opened = {
@@ -1186,7 +1189,7 @@ def main():
                 }
                 
                 # Exit only if sell EV > hold EV
-                if hold_ev['recommendation'] == 'sell':
+                if should_exit_for_hold_ev(hold_ev['recommendation']):
                     close_reason = 'sell_ev_exceeds_hold_ev'
                     break
             except Exception as e:
@@ -1196,7 +1199,7 @@ def main():
     else:
         # Legacy stop-loss mode
         report['exit_mode'] = 'legacy_stop_loss'
-        sl_price = opened['entry_price'] * (1.0 - args.stop_loss_pct)
+        sl_price = stop_loss_trigger_price(opened['entry_price'], args.stop_loss_pct)
         report['stop_loss_price'] = sl_price
         close_reason = None
         
@@ -1214,7 +1217,7 @@ def main():
             
             report['last_side_price'] = side_px
             report['last_check_at'] = ts_utc()
-            if side_px is not None and side_px <= sl_price:
+            if stop_loss_hit(side_px, sl_price):
                 close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
                 break
             time.sleep(args.poll_sec)

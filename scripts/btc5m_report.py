@@ -6,26 +6,11 @@ import os
 from pathlib import Path
 from collections import Counter
 
+from btc_5m_report_tail import load_tail_json
+
 
 def default_runtime_dir() -> str:
     return str(Path(__file__).resolve().parents[1] / "runtime")
-
-
-def load_tail_json(path: str):
-    try:
-        txt = open(path, "r", encoding="utf-8", errors="ignore").read()
-    except Exception:
-        return None
-    i = txt.rfind("\n{")
-    if i == -1 and txt.startswith("{"):
-        i = 0
-    if i == -1:
-        return None
-    blob = txt[i + 1 :] if txt[i : i + 1] == "\n" else txt[i:]
-    try:
-        return json.loads(blob)
-    except Exception:
-        return None
 
 
 def main():
