@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 import requests
 
+from btc_5m_feed_ts import parse_source_ts
+
 
 TWAP_WINDOW_SEC = 60.0
 BUCKET_SEC = 300.0
@@ -61,19 +63,6 @@ class FairValue:
     receipt_ts: Optional[float] = None
     decision_ts: Optional[float] = None
     spot_ignored: bool = False
-
-
-def parse_source_ts(data: dict[str, Any]) -> Optional[float]:
-    """Extract feed-produced timestamp from an RTDS/API payload. Never invent one."""
-    for key in ("sourceTs", "source_ts", "timestamp", "ts", "time"):
-        raw = data.get(key)
-        if raw is None:
-            continue
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            continue
-    return None
 
 
 def settle_window_weights(
