@@ -43,6 +43,12 @@ from btc_5m_winmore_gates import (
     select_entry,
     winmore_config_from_mapping,
 )
+from btc_5m_session_flags import (
+    POLL_MAX_SPREAD,
+    classify_no_entry_result,
+    open_env_defaults,
+    settle_allow_fallback,
+)
 
 UTC = dt.timezone.utc
 
@@ -365,8 +371,8 @@ def run_open(
     env = os.environ.copy()
     # Set reasonable defaults for safety guards instead of disabling them
     # Only override if not already set in environment
-    env.setdefault('PM_MAX_SPREAD', '0.05')
-    env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '10')
+    for key, value in open_env_defaults().items():
+        env.setdefault(key, value)
     # W2: honor prefer_post_only. Do not leave a sticky FAK env default in place.
     env['PM_ORDER_TYPE'] = str(order_type or 'GTD').upper()
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, env=env)
@@ -782,14 +788,14 @@ def main():
             })
 
             # Enforce spread gate: skip if spread is too wide
-            max_spread = 0.03
+            max_spread = POLL_MAX_SPREAD
             if min_spread is not None and min_spread > max_spread:
                 if maker_on:
                     wide_sig = 'unavailable'
                     if fair_calc is not None:
                         try:
                             fv_wide = fair_calc.calculate_fair_value(
-                                slug, sec_left, args.btc_daily_vol_pct, allow_fallback=not args.execute
+                                slug, sec_left, args.btc_daily_vol_pct, allow_fallback=settle_allow_fallback(args.execute)
                             )
                             if fv_wide is not None:
                                 wide_sig = fv_wide.edge_signal
@@ -841,7 +847,7 @@ def main():
                 
                 # Calculate fair value based on TWAP
                 # For --execute mode, never allow fallback; for dry-run, fallback is OK
-                allow_fallback = not args.execute
+                allow_fallback = settle_allow_fallback(args.execute)
                 fair_value = fair_calc.calculate_fair_value(
                     slug, 
                     sec_left, 
@@ -1117,10 +1123,7 @@ def main():
     if not opened:
         report['finished_at'] = ts_utc()
         attach_maker_pilot_summary(report, maker_engine)
-        if maker_on:
-            report['result'] = 'maker_pilot_shadow_complete'
-        else:
-            report['result'] = 'no_entry_timeout'
+        report['result'] = classify_no_entry_result(maker_on)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 
@@ -1152,7 +1155,7 @@ def main():
             # Get current fair value and CLOB bid
             try:
                 sec_left = max(0, end_ts - now)
-                allow_fallback = not args.execute
+                allow_fallback = settle_allow_fallback(args.execute)
                 fair_value = fair_calc.calculate_fair_value(
                     slug, 
                     sec_left, 
@@ -1424,7 +1427,7 @@ def main():
         window_open_twap = fair_calc.get_window_open_twap(opened['market_slug'])
         if window_open_twap is not None and held_to_redeem:
             try:
-                allow_fallback = not args.execute
+                allow_fallback = settle_allow_fallback(args.execute)
                 settle_result = log_twap_settle(
                     opened['market_slug'],
                     window_open_twap,
