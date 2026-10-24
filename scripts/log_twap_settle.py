@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from btc_5m_twap_fair import ChainlinkTWAPTracker
+from btc_5m_runner_close_state import twap_position_wins, twap_settle_result
 
 
 def log_twap_settle(market_slug: str, window_open_twap: float, side: str, allow_fallback: bool = True):
@@ -36,10 +37,8 @@ def log_twap_settle(market_slug: str, window_open_twap: float, side: str, allow_
         window_seconds = final_snapshot.window_seconds
         series_id = final_snapshot.series_id
         
-        # Determine result: Up wins if final >= open
-        up_wins = final_twap >= window_open_twap
-        result = "UP" if up_wins else "DOWN"
-        position_wins = (side == result)
+        result = twap_settle_result(final_twap, window_open_twap)
+        position_wins = twap_position_wins(side, result)
         
         print(f"[TWAP_SETTLE] market={market_slug} "
               f"windowSeconds={window_seconds} "

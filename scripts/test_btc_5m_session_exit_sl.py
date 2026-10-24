@@ -43,6 +43,12 @@ from btc_5m_winmore_gates import (
     select_entry,
     winmore_config_from_mapping,
 )
+from btc_5m_runner_close_state import (
+    maker_fair_signal_when_spread_blocked,
+    maker_tick_rtds_ready,
+    pnl_for_state_tracker,
+    resolve_gtc_fallback_reference_px,
+)
 
 UTC = dt.timezone.utc
 
@@ -755,7 +761,7 @@ def main():
                         down_book=dn_side_book,
                         stake_usd=args.stake_usd,
                         execute=args.execute,
-                        rtds_ready=False,
+                        rtds_ready=maker_tick_rtds_ready('too_late', args.execute),
                         bucket=current_bucket,
                         slug=slug,
                         seconds_left=sec_left,
@@ -791,8 +797,9 @@ def main():
                             fv_wide = fair_calc.calculate_fair_value(
                                 slug, sec_left, args.btc_daily_vol_pct, allow_fallback=not args.execute
                             )
-                            if fv_wide is not None:
-                                wide_sig = fv_wide.edge_signal
+                            wide_sig = maker_fair_signal_when_spread_blocked(
+                                fv_wide.edge_signal if fv_wide is not None else None
+                            )
                         except Exception:
                             pass
                     run_maker_pilot_tick(
@@ -804,7 +811,7 @@ def main():
                         down_book=dn_side_book,
                         stake_usd=args.stake_usd,
                         execute=args.execute,
-                        rtds_ready=bool(args.execute),
+                        rtds_ready=maker_tick_rtds_ready('spread_wide', args.execute),
                         bucket=current_bucket,
                         slug=slug,
                         seconds_left=sec_left,
@@ -860,7 +867,7 @@ def main():
                             down_book=dn_side_book,
                             stake_usd=args.stake_usd,
                             execute=args.execute,
-                            rtds_ready=bool(args.execute),
+                            rtds_ready=maker_tick_rtds_ready('normal', args.execute),
                             bucket=current_bucket,
                             slug=slug,
                             seconds_left=sec_left,
@@ -943,7 +950,7 @@ def main():
                         down_book=dn_side_book,
                         stake_usd=args.stake_usd,
                         execute=args.execute,
-                        rtds_ready=bool(args.execute),
+                        rtds_ready=maker_tick_rtds_ready('normal', args.execute),
                         bucket=current_bucket,
                         slug=slug,
                         seconds_left=sec_left,
@@ -1257,11 +1264,11 @@ def main():
         # fallback: if FAK has no instant match, try a GTC limit close near current side price
         txt = ((out or '') + '\n' + json.dumps(close_obj, ensure_ascii=False)).lower()
         if 'no orders found to match with fak order' in txt:
-            px = get_side_price_from_slug(opened['market_slug'], opened['side'])
-            if px is None:
-                px = report.get('last_side_price')
-            if px is None:
-                px = opened['entry_price']
+            px = resolve_gtc_fallback_reference_px(
+                get_side_price_from_slug(opened['market_slug'], opened['side']),
+                report.get('last_side_price'),
+                opened['entry_price'],
+            )
             bb = None
             try:
                 bb = clob_best_bid(opened['token_id'])
@@ -1416,7 +1423,7 @@ def main():
         close_status = 'failed'
     
     # Update state tracker with close
-    pnl_for_tracker = pnl if pnl is not None else 0.0
+    pnl_for_tracker = pnl_for_state_tracker(pnl)
     state_tracker.close_ticket(opened['bucket'], pnl_for_tracker, close_status)
     
     # Log TWAP settlement if position was held to redeem
