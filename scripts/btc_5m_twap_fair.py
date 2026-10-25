@@ -22,6 +22,12 @@ from dataclasses import dataclass
 
 import requests
 
+from btc_5m_twap_cache import (
+    cache_entry_fresh,
+    cached_twap_allowed,
+    twap_cache_key,
+)
+
 
 TWAP_WINDOW_SEC = 60.0
 BUCKET_SEC = 300.0
@@ -257,13 +263,14 @@ class ChainlinkTWAPTracker:
         
         allow_fallback: If False, raises if RTDS not configured (for --execute mode)
         """
-        cache_key = "current"
+        cache_key = twap_cache_key()
         now = time.time()
         
         if cache_key in self._cache:
             cached = self._cache[cache_key]
-            if now - cached.timestamp < self._cache_ttl_sec:
-                return cached
+            if cache_entry_fresh(cached.timestamp, now, self._cache_ttl_sec):
+                if cached_twap_allowed(cached.source, allow_fallback):
+                    return cached
         
         # Try RTDS if configured
         if self.rtds_endpoint and self.rtds_api_key:
