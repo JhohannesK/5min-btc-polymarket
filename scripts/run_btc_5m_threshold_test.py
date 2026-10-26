@@ -25,6 +25,34 @@ def canonical_script() -> str:
     return str(Path(__file__).resolve().with_name("test_btc_5m_session_exit_sl.py"))
 
 
+def canonical_cmd(
+    *,
+    profile: str,
+    threshold: float,
+    stake_usd: float,
+    entry_timeout_min: int,
+    poll_sec: float,
+    execute: bool,
+) -> list[str]:
+    cmd = [
+        ".venv/bin/python",
+        canonical_script(),
+        "--profile",
+        str(profile),
+        "--threshold",
+        str(threshold),
+        "--stake-usd",
+        str(stake_usd),
+        "--entry-timeout-min",
+        str(entry_timeout_min),
+        "--poll-sec",
+        str(poll_sec),
+    ]
+    if execute:
+        cmd.append("--execute")
+    return cmd
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--threshold", type=float, default=0.70)
@@ -36,25 +64,17 @@ def main() -> int:
     ap.add_argument("--poll-sec", type=float, default=2.0)
     args = ap.parse_args()
 
-    script = canonical_script()
-    cmd = [
-        ".venv/bin/python",
-        script,
-        "--profile",
-        str(args.profile),
-        "--threshold",
-        str(args.threshold),
-        "--stake-usd",
-        str(args.stake_usd),
-        "--entry-timeout-min",
-        str(args.entry_timeout_min),
-        "--poll-sec",
-        str(args.poll_sec),
-    ]
-    if args.execute:
-        cmd.append("--execute")
-
-    p = subprocess.run(cmd, cwd=args.repo)
+    p = subprocess.run(
+        canonical_cmd(
+            profile=args.profile,
+            threshold=args.threshold,
+            stake_usd=args.stake_usd,
+            entry_timeout_min=args.entry_timeout_min,
+            poll_sec=args.poll_sec,
+            execute=args.execute,
+        ),
+        cwd=args.repo,
+    )
     return int(p.returncode)
 
 
