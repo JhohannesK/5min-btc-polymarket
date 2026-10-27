@@ -76,6 +76,24 @@ def parse_source_ts(data: dict[str, Any]) -> Optional[float]:
     return None
 
 
+def rtds_snapshot_from_payload(data: dict[str, Any], now: float) -> TWAPSnapshot:
+    """Map an RTDS JSON body to a snapshot. Raises if windowSeconds is not int 60."""
+    window_seconds = data.get("windowSeconds")
+    if window_seconds != 60:
+        raise ValueError(f"RTDS returned wrong window: {window_seconds}s, expected 60s")
+    receipt_ts = now
+    source_ts = parse_source_ts(data)
+    return TWAPSnapshot(
+        timestamp=receipt_ts,
+        twap_60s=float(data["value"]),
+        window_seconds=window_seconds,
+        source="chainlink_rtds",
+        series_id=data.get("series", "btc-usd-twap-60s"),
+        source_ts=source_ts if source_ts is not None else receipt_ts,
+        receipt_ts=receipt_ts,
+    )
+
+
 def settle_window_weights(
     seconds_left: float,
     twap_window_sec: float = TWAP_WINDOW_SEC,
@@ -282,25 +300,9 @@ class ChainlinkTWAPTracker:
                 )
                 response.raise_for_status()
                 data = response.json()
-                
-                # Validate windowSeconds from feed (never invent it)
-                window_seconds = data.get('windowSeconds')
-                if window_seconds != 60:
-                    raise ValueError(f"RTDS returned wrong window: {window_seconds}s, expected 60s")
-                
-                receipt_ts = now
-                source_ts = parse_source_ts(data)
-                snapshot = TWAPSnapshot(
-                    timestamp=receipt_ts,
-                    twap_60s=float(data['value']),
-                    window_seconds=window_seconds,
-                    source="chainlink_rtds",
-                    series_id=data.get('series', 'btc-usd-twap-60s'),
-                    source_ts=source_ts if source_ts is not None else receipt_ts,
-                    receipt_ts=receipt_ts,
-                )
+                snapshot = rtds_snapshot_from_payload(data, now)
                 self._cache[cache_key] = snapshot
-                print(f"[RTDS] Connected successfully: windowSeconds={window_seconds}")
+                print(f"[RTDS] Connected successfully: windowSeconds={snapshot.window_seconds}")
                 return snapshot
             except Exception as e:
                 print(f"[RTDS_ERROR] Failed to connect: {e}")
