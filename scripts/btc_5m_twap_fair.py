@@ -63,6 +63,23 @@ class FairValue:
     spot_ignored: bool = False
 
 
+def spot_price_from_payload(source: str, data: Any) -> Optional[float]:
+    """Map a Binance/Coinbase ticker JSON body to a positive BTCUSD price.
+
+    Returns None for unknown sources, non-positive prices, or unusable payloads.
+    """
+    try:
+        if source == "binance":
+            price = float(data.get("price", 0))
+        elif source == "coinbase":
+            price = float(data.get("data", {}).get("amount", 0))
+        else:
+            return None
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return price if price > 0 else None
+
+
 def parse_source_ts(data: dict[str, Any]) -> Optional[float]:
     """Extract feed-produced timestamp from an RTDS/API payload. Never invent one."""
     for key in ("sourceTs", "source_ts", "timestamp", "ts", "time"):
@@ -351,16 +368,8 @@ class ChainlinkTWAPTracker:
             try:
                 r = requests.get(url, timeout=3)
                 r.raise_for_status()
-                data = r.json()
-                
-                if name == "binance":
-                    price = float(data.get("price", 0))
-                elif name == "coinbase":
-                    price = float(data.get("data", {}).get("amount", 0))
-                else:
-                    continue
-                
-                if price > 0:
+                price = spot_price_from_payload(name, r.json())
+                if price is not None:
                     prices.append(price)
             except Exception:
                 continue
