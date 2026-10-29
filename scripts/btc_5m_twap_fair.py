@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 import requests
 
+from btc_5m_spot_fallback import spot_twap_from_sources
+
 
 TWAP_WINDOW_SEC = 60.0
 BUCKET_SEC = 300.0
@@ -341,34 +343,19 @@ class ChainlinkTWAPTracker:
         This is a fallback; production should use actual Chainlink TWAP.
         Fetches spot from multiple sources and averages.
         """
-        sources = [
-            ("binance", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"),
-            ("coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot"),
-        ]
-        
-        prices = []
-        for name, url in sources:
-            try:
-                r = requests.get(url, timeout=3)
-                r.raise_for_status()
-                data = r.json()
-                
-                if name == "binance":
-                    price = float(data.get("price", 0))
-                elif name == "coinbase":
-                    price = float(data.get("data", {}).get("amount", 0))
-                else:
-                    continue
-                
-                if price > 0:
-                    prices.append(price)
-            except Exception:
-                continue
-        
-        if not prices:
-            return None
-        
-        return sum(prices) / len(prices)
+        def fetch_price(name: str, url: str) -> Optional[float]:
+            r = requests.get(url, timeout=3)
+            r.raise_for_status()
+            data = r.json()
+            if name == "binance":
+                price = float(data.get("price", 0))
+            elif name == "coinbase":
+                price = float(data.get("data", {}).get("amount", 0))
+            else:
+                return None
+            return price if price > 0 else None
+
+        return spot_twap_from_sources(fetch_price)
 
 
 class FairValueCalculator:
