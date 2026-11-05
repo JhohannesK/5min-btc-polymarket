@@ -34,6 +34,9 @@ from btc_5m_maker_pilot import (
     format_maker_pilot_report,
     summarize_maker_pilot,
 )
+from btc_5m_book_notional import best_ask_notional as _best_ask_notional
+from btc_5m_book_notional import min_spread as _min_spread
+from btc_5m_order_guard import cancel_token_orders, poll_order_status
 from btc_5m_winmore_gates import (
     EntryDecision,
     WinmoreConfig,
@@ -170,24 +173,6 @@ def _best_bid_ask(book) -> tuple[Optional[float], Optional[float]]:
     return best_bid, best_ask
 
 
-def _best_ask_notional(book) -> float:
-    """Top-of-book ask notional in USD (price * size). 0 if the book is empty."""
-    asks = getattr(book, 'asks', []) or []
-    best_p = None
-    best_sz = 0.0
-    for a in asks:
-        p = float(getattr(a, 'price', 0) or 0)
-        if p <= 0:
-            continue
-        sz = float(getattr(a, 'size', 0) or 0)
-        if best_p is None or p < best_p:
-            best_p = p
-            best_sz = sz
-    if best_p is None:
-        return 0.0
-    return best_p * best_sz
-
-
 def fetch_clob_books(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com'):
     """Fetch both CLOB books once (asks+bids+depth)."""
     pub = ClobClient(host=clob_base, chain_id=POLYGON)
@@ -226,13 +211,6 @@ def clob_side_books(
         side_book_from_clob('UP', up_token, up_raw),
         side_book_from_clob('DOWN', down_token, dn_raw),
     )
-
-
-def _min_spread(up_book: SideBook, dn_book: SideBook) -> Optional[float]:
-    spreads = [s for s in (up_book.spread, dn_book.spread) if s is not None]
-    if not spreads:
-        return None
-    return min(spreads)
 
 
 def run_maker_pilot_tick(
@@ -310,37 +288,6 @@ def auth_clob_client(clob_base: str = 'https://clob.polymarket.com') -> Optional
         return c
     except Exception:
         return None
-
-
-def poll_order_status(client: Optional[ClobClient], order_id: str, wait_sec: float = 6.0, step_sec: float = 1.0) -> tuple[str, Optional[dict[str, Any]]]:
-    if client is None or not order_id:
-        return '', None
-    deadline = time.time() + max(0.0, float(wait_sec))
-    last = None
-    while time.time() <= deadline:
-        try:
-            last = client.get_order(order_id)
-            st = str((last or {}).get('status') or '').upper()
-            if st and st not in ('LIVE', 'OPEN'):
-                return st, last
-        except Exception:
-            pass
-        time.sleep(max(0.2, float(step_sec)))
-    try:
-        last = client.get_order(order_id)
-    except Exception:
-        pass
-    st = str((last or {}).get('status') or '').upper()
-    return st, last
-
-
-def cancel_token_orders(client: Optional[ClobClient], token_id: str) -> Optional[dict[str, Any]]:
-    if client is None:
-        return None
-    try:
-        return client.cancel_market_orders(asset_id=str(token_id))
-    except Exception as e:
-        return {'error': str(e)}
 
 
 def run_open(
