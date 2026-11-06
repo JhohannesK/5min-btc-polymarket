@@ -5,6 +5,8 @@ import json
 import os
 import pathlib
 
+from btc_5m_latest_log_glob import LATEST_LOG_NAME_GLOB
+
 
 def default_runtime_dir() -> str:
     return str(pathlib.Path(__file__).resolve().parents[1] / "runtime")
@@ -27,7 +29,11 @@ def main():
     ap.add_argument("--mark", action="store_true")
     args = ap.parse_args()
 
-    logs = sorted(glob.glob(os.path.join(args.runtime_dir, "btc5m_*.log")), key=os.path.getmtime, reverse=True)
+    logs = sorted(
+        glob.glob(os.path.join(args.runtime_dir, LATEST_LOG_NAME_GLOB)),
+        key=os.path.getmtime,
+        reverse=True,
+    )
     if not logs:
         print("NO_REPORT:no_logs")
         return
